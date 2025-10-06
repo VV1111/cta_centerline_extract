@@ -33,6 +33,10 @@ from pyqtgraph.Qt import QtCore, QtWidgets, QtGui
 from pyqtgraph.Qt.QtGui import QKeySequence, QShortcut
 import pyqtgraph.opengl as gl
 
+from utils.centerline import (
+    CenterlineOptions, compute_centerline,
+    save_centerline_mask_nii, save_centerline_yaml
+)
 
 # ---------- Utility: centralize plane names ----------
 PLANES = ["Axial", "Coronal", "Sagittal"]
@@ -63,7 +67,241 @@ class VolumeData(QtCore.QObject):
         self.display_mode = "overlay"   # "overlay" | "image_only" | "mask_only" | "image_masked"
 
         self._lut_colors = None    # (K, 4) RGBA uint8 颜色表（A通道不用，按像素填）
+
+        self._undo_stack = []          # list[dict] 每个动作的稀疏 diff
+        self._redo_stack = []
+        self._undo_capacity = 20      
         
+        # 画笔当前目标标签（由 UI 设置；0=背景=删除）
+        self.brush_label = 1              # 写成哪个标签
+        self.apply_only_label = None      # None=All；否则仅当旧值==此标签时才改
+
+
+
+
+    def set_brush_label(self, lab: int):
+        lab = int(max(0, lab))
+        if getattr(self, "brush_label", None) != lab:
+            self.brush_label = lab
+            self.paramsChanged.emit()
+            
+    def set_apply_only_label(self, lab: int | None):
+        """lab 为 None 表示 All；否则仅修改原值==lab 的像素"""
+        if lab is not None:
+            lab = int(max(0, lab))
+        if getattr(self, "apply_only_label", None) != lab:
+            self.apply_only_label = lab
+            self.paramsChanged.emit()
+            
+    # ====== 工具：把 view 坐标索引转换封装到调用侧做，这里只改切片 ======
+    def apply_brush_disk(self, plane: str, idx: int, cx: int, cy: int, radius: int):
+        if not self.has_mask() or not self.is_loaded(): return
+        sl = self.get_mask_slice(plane, idx)
+        if sl is None: return
+        h, w = sl.shape
+        r = max(1, int(radius))
+        y, x = np.ogrid[:h, :w]
+        region = (x - cx)**2 + (y - cy)**2 <= r*r
+
+        # —— 关键：按 ApplyTo 过滤 —— #
+        if self.apply_only_label is not None:
+            region = region & (sl == self.apply_only_label)
+
+        if not np.any(region): 
+            return
+
+        old = sl[region]
+        new = np.full(old.shape, self.brush_label, dtype=np.int32)
+        changed = (old != new)
+        if not np.any(changed): 
+            return
+
+        coords = np.argwhere(region)[changed]
+        old_vals = old[changed].copy()
+
+        sl[region] = new
+        if plane == "Axial":   self._mask[idx, :, :] = sl
+        elif plane == "Coronal": self._mask[:, idx, :] = sl
+        elif plane == "Sagittal": self._mask[:, :, idx] = sl
+
+        self._push_undo({
+            "type": "disk", "plane": plane, "idx": int(idx),
+            "coords": coords, "old": old_vals,
+            "new": np.full_like(old_vals, self.brush_label, dtype=np.int32),
+        })
+        self._redo_stack.clear()
+        self.paramsChanged.emit()
+
+    # def apply_polygon_fill(self, plane: str, idx: int, poly_rc: np.ndarray):
+    #     """
+    #     poly_rc: N x 2 的 (row, col) 浮点或整点，表示闭合多边形顶点（最后一个不必等于第一个）。
+    #     用 QImage 填充生成二维布尔蒙版，再按 brush_label 改写。
+    #     """
+    #     if not self.has_mask() or not self.is_loaded():
+    #         return
+    #     sl = self.get_mask_slice(plane, idx)
+    #     if sl is None:
+    #         return
+    #     h, w = sl.shape
+
+    #     # # 用 QImage/QPainter 填充多边形 -> 二值图
+    #     # img = QtGui.QImage(w, h, QtGui.QImage.Format_Grayscale8)
+    #     # img.fill(0)
+    #     # painter = QtGui.QPainter(img)
+    #     # painter.setPen(QtCore.Qt.NoPen)
+    #     # painter.setBrush(QtGui.QBrush(QtCore.Qt.white))
+    #     # qpoly = QtGui.QPolygonF([QtCore.QPointF(c, r) for (r, c) in poly_rc])
+    #     # painter.drawPolygon(qpoly)
+    #     # painter.end()
+
+    #     # ptr = img.bits(); ptr.setsize(img.byteCount())
+    #     # mask = np.frombuffer(ptr, dtype=np.uint8).reshape((h, w)) > 0
+
+    #     img = QtGui.QImage(w, h, QtGui.QImage.Format_Grayscale8)
+    #     img.fill(0)
+    #     painter = QtGui.QPainter(img)
+    #     painter.setPen(QtCore.Qt.NoPen)
+    #     painter.setBrush(QtGui.QBrush(QtCore.Qt.white))
+    #     qpoly = QtGui.QPolygonF([QtCore.QPointF(c, r) for (r, c) in poly_rc])
+    #     painter.drawPolygon(qpoly)
+    #     painter.end()
+
+    #     # ptr = img.bits(); ptr.setsize(img.byteCount())
+    #     # stride = img.bytesPerLine()              # 每行实际字节数（含对齐填充）
+    #     # buf = np.frombuffer(ptr, dtype=np.uint8)
+    #     # arr = buf.reshape((h, stride))[:, :w]    # 裁掉行尾填充
+    #     # mask = arr > 0
+    #     ptr = img.bits()  # memoryview
+    #     # Qt6 有 sizeInBytes()/bytesPerLine()，直接用它们，不需要 setsize
+    #     nbytes = int(img.sizeInBytes())
+    #     stride = int(img.bytesPerLine())
+    #     buf = np.frombuffer(ptr, dtype=np.uint8, count=nbytes)
+    #     arr = buf.reshape((h, stride))[:, :w]   # 裁去行尾对齐填充
+    #     mask = arr > 0
+
+
+
+    #     old = sl[mask]
+    #     new = np.full(old.shape, self.brush_label, dtype=np.int32)
+    #     changed = (old != new)
+    #     if not np.any(changed):
+    #         return
+    #     coords = np.argwhere(mask)[changed]
+    #     old_vals = old[changed].copy()
+
+    #     sl[mask] = new
+    #     if plane == "Axial":
+    #         self._mask[idx, :, :] = sl
+    #     elif plane == "Coronal":
+    #         self._mask[:, idx, :] = sl
+    #     elif plane == "Sagittal":
+    #         self._mask[:, :, idx] = sl
+
+    #     self._push_undo({
+    #         "type": "poly",
+    #         "plane": plane,
+    #         "idx": int(idx),
+    #         "coords": coords,
+    #         "old": old_vals,
+    #         "new": np.full_like(old_vals, self.brush_label, dtype=np.int32),
+    #     })
+    #     self._redo_stack.clear()
+    #     self.paramsChanged.emit()
+
+    def apply_polygon_fill(self, plane: str, idx: int, poly_rc: np.ndarray):
+        if not self.has_mask() or not self.is_loaded(): return
+        sl = self.get_mask_slice(plane, idx)
+        if sl is None: return
+        h, w = sl.shape
+
+        img = QtGui.QImage(w, h, QtGui.QImage.Format_Grayscale8)
+        img.fill(0)
+        p = QtGui.QPainter(img); p.setPen(QtCore.Qt.NoPen); p.setBrush(QtGui.QBrush(QtCore.Qt.white))
+        qpoly = QtGui.QPolygonF([QtCore.QPointF(c, r) for (r, c) in poly_rc])
+        p.drawPolygon(qpoly); p.end()
+
+        ptr = img.bits()
+        stride = img.bytesPerLine()
+        buf = np.frombuffer(ptr, dtype=np.uint8, count=h*stride)
+        arr = buf.reshape((h, stride))[:, :w]
+        region = (arr > 0)
+
+        # —— 关键：按 ApplyTo 过滤 —— #
+        if self.apply_only_label is not None:
+            region = region & (sl == self.apply_only_label)
+
+        if not np.any(region): 
+            return
+
+        old = sl[region]
+        new = np.full(old.shape, self.brush_label, dtype=np.int32)
+        changed = (old != new)
+        if not np.any(changed): 
+            return
+
+        coords = np.argwhere(region)[changed]
+        old_vals = old[changed].copy()
+
+        sl[region] = new
+        if plane == "Axial":   self._mask[idx, :, :] = sl
+        elif plane == "Coronal": self._mask[:, idx, :] = sl
+        elif plane == "Sagittal": self._mask[:, :, idx] = sl
+
+        self._push_undo({
+            "type": "poly", "plane": plane, "idx": int(idx),
+            "coords": coords, "old": old_vals,
+            "new": np.full_like(old_vals, self.brush_label, dtype=np.int32),
+        })
+        self._redo_stack.clear()
+        self.paramsChanged.emit()
+
+    def _push_undo(self, diff: dict):
+        self._undo_stack.append(diff)
+        if len(self._undo_stack) > self._undo_capacity:
+            self._undo_stack.pop(0)
+
+    def undo(self):
+        if not self._undo_stack:
+            return False
+        diff = self._undo_stack.pop()
+        self._apply_diff(diff, use_old=True)
+        self._redo_stack.append(diff)
+        self.paramsChanged.emit()
+        return True
+
+    def redo(self):
+        if not self._redo_stack:
+            return False
+        diff = self._redo_stack.pop()
+        self._apply_diff(diff, use_old=False)
+        self._undo_stack.append(diff)
+        self.paramsChanged.emit()
+        return True
+
+    def _apply_diff(self, diff: dict, use_old: bool):
+        plane, idx = diff["plane"], diff["idx"]
+        sl = self.get_mask_slice(plane, idx)
+        if sl is None:
+            return
+        coords = diff["coords"]
+        vals = diff["old"] if use_old else diff["new"]
+        sl[coords[:,0], coords[:,1]] = vals
+        if plane == "Axial":
+            self._mask[idx, :, :] = sl
+        elif plane == "Coronal":
+            self._mask[:, idx, :] = sl
+        elif plane == "Sagittal":
+            self._mask[:, :, idx] = sl
+
+    def save_mask(self, path: str):
+        if self._mask is None:
+            raise ValueError("No mask to save.")
+        affine = self._affine if self._affine is not None else np.eye(4)
+        img = nib.Nifti1Image(self._mask.astype(np.int32, copy=False), affine)
+        nib.save(img, path)
+
+
+
     def is_loaded(self):
         return self._vol is not None and self._vol.ndim == 3
 
@@ -313,15 +551,6 @@ class ImagePreview(QtWidgets.QFrame):
         # 中间的细长 slider
         title.addWidget(self.hdrSlider, 1)
 
-        # 新增：Update 3D 按钮（点击后才渲染3D）
-        # TODO 这个应该是只有这个3d 预览才有其他没有
-        # self.btnUpdate3D = QtWidgets.QToolButton()
-        # self.btnUpdate3D.setText("Update")
-        # self.btnUpdate3D.setToolTip("Regenerate 3D preview with current mode")
-        # self.btnUpdate3D.clicked.connect(self.update3DRequested.emit)
-
-        # title.addWidget(self.btnUpdate3D)
-
         # 放大按钮
         title.addWidget(self.btnZoom)
 
@@ -383,6 +612,8 @@ class ImagePreview(QtWidgets.QFrame):
             img = self.volume.render_image_masked_slice(self.plane, idx)
             if img is not None:
                 self.img_item.setImage(img.T, autoLevels=False, levels=(0.0, 1.0))
+                # self.img_item.setImage(img, autoLevels=False, levels=(0.0, 1.0))
+
                 self.view.autoRange()
             # 该模式下不显示彩色 mask 覆盖
             self.mask_item.setVisible(False)
@@ -391,6 +622,7 @@ class ImagePreview(QtWidgets.QFrame):
             img = self.volume.render_slice(self.plane, idx)
             if img is not None:
                 self.img_item.setImage(img.T, autoLevels=False, levels=(0.0, 1.0))
+                # self.img_item.setImage(img, autoLevels=False, levels=(0.0, 1.0))
                 self.view.autoRange()
             # 叠加/仅 mask / 仅图 由这个函数处理
             self._update_mask_layer(idx)
@@ -415,6 +647,8 @@ class ImagePreview(QtWidgets.QFrame):
 
         # 注意：RGBA 不转置会导致方向错位，这里也做转置
         self.mask_item.setImage(rgba.transpose(1, 0, 2), autoLevels=False)
+        # self.mask_item.setImage(rgba, autoLevels=False)
+
         self.mask_item.setVisible(True)
 
         if mode == "mask_only":
@@ -441,7 +675,9 @@ class ImagePreview(QtWidgets.QFrame):
             # 只显示 mask 区域的原图
             img = self.volume.render_image_masked_slice(self.plane, idx)
             if img is not None:
-                self.img_item.setImage(img.T, autoLevels=False, levels=(0.0, 1.0))
+                # self.img_item.setImage(img.T, autoLevels=False, levels=(0.0, 1.0))
+                self.img_item.setImage(img, autoLevels=False, levels=(0.0, 1.0))
+
                 self.view.autoRange()
             # 该模式下不显示彩色 mask 覆盖
             self.mask_item.setVisible(False)
@@ -449,7 +685,9 @@ class ImagePreview(QtWidgets.QFrame):
             # 正常原图
             img = self.volume.render_slice(self.plane, idx)
             if img is not None:
-                self.img_item.setImage(img.T, autoLevels=False, levels=(0.0, 1.0))
+                # self.img_item.setImage(img.T, autoLevels=False, levels=(0.0, 1.0))
+                self.img_item.setImage(img, autoLevels=False, levels=(0.0, 1.0))
+
                 self.view.autoRange()
             # 叠加/仅 mask / 仅图 由这个函数处理
             self._update_mask_layer(idx)
@@ -831,6 +1069,8 @@ class DetailView(QtWidgets.QFrame):
         self.volume = volume
         self.volume.paramsChanged.connect(self._rerender_active)
         self.active_plane = None  # which preview we are mirroring
+        self._tool_mode = 0  # 0=BRUSH, 1=POLY
+        
 
         # Header
         top = QtWidgets.QHBoxLayout()
@@ -870,10 +1110,31 @@ class DetailView(QtWidgets.QFrame):
         self.img_item.setLevels((0.0, 1.0))
 
 
+        # 让视图能接收键盘焦点
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)
+        self.glw.setFocusPolicy(QtCore.Qt.StrongFocus)
+        self.view.setFocusPolicy(QtCore.Qt.StrongFocus)
+
 
         self.mask_item = pg.ImageItem()
         self.mask_item.setZValue(10)
         self.view.addItem(self.mask_item)
+        
+                
+        # 编辑状态
+        self._edit_enabled = False
+        self._brush_radius = 8
+        self._poly_points = []        # [(x,y) in image coords]
+        self._poly_curve = pg.PlotDataItem(pen=pg.mkPen((0, 200, 255), width=2))
+        self.view.addItem(self._poly_curve)
+        self._poly_curve.setZValue(20)
+        self._poly_curve.setVisible(False)
+
+        # 显示笔刷位置的小圈圈
+        self._brush_cursor = pg.ScatterPlotItem(size=0, pen=pg.mkPen('y'), brush=pg.mkBrush(0,0,0,0))
+        self._brush_cursor.setZValue(15)
+        self.view.addItem(self._brush_cursor)
+                
         
         # Layout
         lay = QtWidgets.QVBoxLayout(self)
@@ -888,11 +1149,154 @@ class DetailView(QtWidgets.QFrame):
         QShortcut(QKeySequence.ZoomOut, self, activated=self._zoom_out)
         QShortcut(QKeySequence("Ctrl+0"), self, activated=self._reset_view)
         QShortcut(QKeySequence("Meta+0"), self, activated=self._reset_view)  # macOS
+        # 关闭/提交多边形的快捷键兜底
+        QShortcut(QKeySequence(QtCore.Qt.Key_Return), self, activated=self._commit_polygon)
+        QShortcut(QKeySequence(QtCore.Qt.Key_Enter),  self, activated=self._commit_polygon)
+        QShortcut(QKeySequence(QtCore.Qt.Key_Escape), self, activated=self._cancel_polygon)
 
 
         # Connect range change to push back to preview
         self.view.sigRangeChanged.connect(self._on_range_changed)
+        # 捕获场景事件
+        # self.view.scene().installEventFilter(self) # TODO
+        self.glw.scene().installEventFilter(self)
 
+
+
+    def set_tool_mode(self, mode: int):
+        self._tool_mode = 0 if int(mode) == 0 else 1
+        # 切到多边形时，清掉画刷光标；切回刷子时，清多边形
+        if self._tool_mode == 1:
+            self._brush_cursor.setData([])
+        else:
+            self._poly_points.clear()
+            self._poly_curve.setVisible(False)
+
+    def _cancel_polygon(self):
+        self._poly_points.clear()
+        self._poly_curve.setVisible(False)
+
+
+    def eventFilter(self, obj, ev):
+        if self._edit_enabled and self.active_plane is not None:
+            et = ev.type()
+
+            if et == QtCore.QEvent.GraphicsSceneMouseMove:
+                if self._tool_mode == 0:  # BRUSH
+                    pos = ev.scenePos()
+                    self._update_brush_cursor(pos)
+                    if ev.buttons() & QtCore.Qt.LeftButton:
+                        self._paint_at(pos)
+                return False
+
+            elif et == QtCore.QEvent.GraphicsSceneMousePress and ev.button() == QtCore.Qt.LeftButton:
+                if self._tool_mode == 1:  # POLY
+                    self._append_poly_point(ev.scenePos())
+                else:                      # BRUSH
+                    self._paint_at(ev.scenePos())
+                return True
+
+            elif et == QtCore.QEvent.KeyPress:
+                if ev.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
+                    if self._tool_mode == 1:   # 只有多边形模式时提交
+                        self._commit_polygon()
+                    return True
+                elif ev.key() == QtCore.Qt.Key_Escape:
+                    self._cancel_polygon()
+                    return True
+
+            elif et == QtCore.QEvent.GraphicsSceneMouseDoubleClick:
+                if self._tool_mode == 1 and self._poly_points:
+                    self._commit_polygon()
+                    return True
+
+        return super().eventFilter(obj, ev)
+
+
+
+    def _scene_to_image_rc(self, scenePos):
+        p = self.img_item.mapFromScene(scenePos)
+        # 因为 setImage(img.T)，显示坐标 x 对应 row，y 对应 col
+        r = int(round(p.x()))
+        c = int(round(p.y()))
+        return r, c
+
+
+    def _paint_at(self, scenePos):
+        if self.active_plane is None:
+            return
+        r, c = self._scene_to_image_rc(scenePos)
+        idx = self.volume.slices[self.active_plane]
+        # 边界保护
+        z,y,x = self.volume.shape_zyx()
+        h,w = None,None
+        sl = self.volume.get_slice(self.active_plane, idx)
+        if sl is None: return
+        h,w = sl.shape
+        if not (0 <= r < h and 0 <= c < w):
+            return
+        self.volume.apply_brush_disk(self.active_plane, idx, c, r, self._brush_radius)  # 注意顺序：cx,cy
+        # 刷新当前帧
+        self._rerender_active()
+
+    def _append_poly_point(self, scenePos):
+        # 以图像坐标收集点
+        r, c = self._scene_to_image_rc(scenePos)
+        sl = self.volume.get_slice(self.active_plane, self.volume.slices[self.active_plane])
+        if sl is None: return
+        h,w = sl.shape
+        if 0 <= r < h and 0 <= c < w:
+            self._poly_points.append((r,c))
+            # 画在可视坐标（注意 setImage 时做了转置，故绘制时要 (x,y)=(c,r)）
+            # xs = [p[1] for p in self._poly_points]
+            # ys = [p[0] for p in self._poly_points]
+
+            xs = [p[0] for p in self._poly_points]  # row -> x
+            ys = [p[1] for p in self._poly_points]  # col -> y
+
+            self._poly_curve.setData(xs, ys)
+            self._poly_curve.setVisible(True)
+
+    def _commit_polygon(self):
+        if not self._poly_points or self.active_plane is None:
+            return
+        idx = self.volume.slices[self.active_plane]
+        poly = np.array(self._poly_points, dtype=np.float32)
+        self.volume.apply_polygon_fill(self.active_plane, idx, poly)
+        self._poly_points.clear()
+        self._poly_curve.setVisible(False)
+        self._rerender_active()
+
+    # def _update_brush_cursor(self, scenePos):
+    #     # 仅显示一个环（用 ScatterPlotItem 的 size 模拟）
+    #     r, c = self._scene_to_image_rc(scenePos)
+    #     self._brush_cursor.setData([{'pos': (c, r), 'size': self._brush_radius*2, 'brush': None, 'pen': pg.mkPen('y', width=1)}])
+
+    def _update_brush_cursor(self, scenePos):
+        r, c = self._scene_to_image_rc(scenePos)
+        # 画点时，scene里的 (x,y) = (row, col)
+        self._brush_cursor.setData([{
+            'pos': (r, c),
+            'size': self._brush_radius*2,
+            'brush': None,
+            'pen': pg.mkPen('y', width=1)
+        }])
+
+
+
+
+    def set_edit_enabled(self, on: bool):
+        self._edit_enabled = bool(on)
+        self._poly_points.clear()
+        self._poly_curve.setVisible(False)
+        self._brush_cursor.setData([])
+        if self._edit_enabled:
+            self.view.setFocus()   # 让回车直接进来
+
+
+
+    def set_brush_radius(self, r: int):
+        self._brush_radius = max(1, int(r))
 
 
     def _on_range_changed(self, vb, ranges):
@@ -943,6 +1347,8 @@ class DetailView(QtWidgets.QFrame):
             img = self.volume.render_image_masked_slice(self.active_plane, idx)
             if img is not None:
                 self.img_item.setImage(img.T, autoLevels=False, levels=(0.0, 1.0))
+                # self.img_item.setImage(img, autoLevels=False, levels=(0.0, 1.0))
+
             # 不显示彩色 mask
             self.mask_item.setVisible(False)
             self.img_item.setVisible(True)
@@ -952,6 +1358,7 @@ class DetailView(QtWidgets.QFrame):
             img = self.volume.render_slice(self.active_plane, idx)
             if img is not None:
                 self.img_item.setImage(img.T, autoLevels=False, levels=(0.0, 1.0))
+                # self.img_item.setImage(img, autoLevels=False, levels=(0.0, 1.0))
 
 
         # mask
@@ -969,6 +1376,8 @@ class DetailView(QtWidgets.QFrame):
             return
 
         self.mask_item.setImage(rgba.transpose(1, 0, 2), autoLevels=False)
+        # self.mask_item.setImage(rgba, autoLevels=False)
+
         self.mask_item.setVisible(True)
         if mode == "mask_only":
             self.img_item.setVisible(False)
@@ -1085,6 +1494,15 @@ class LeftToolbar(QtWidgets.QFrame):
     openRequested = QtCore.Signal()
     openMaskRequested = QtCore.Signal()
 
+    editModeToggled = QtCore.Signal(bool)   # 开/关编辑
+    brushSizeChanged = QtCore.Signal(int)   # 半径像素
+    brushLabelChanged = QtCore.Signal(int)  # 作用标签（颜色）
+    saveMaskRequested = QtCore.Signal()
+    undoRequested = QtCore.Signal()
+    redoRequested = QtCore.Signal()
+    toolModeChanged = QtCore.Signal(int)
+    applyFilterChanged = QtCore.Signal(object)   # 传 None 或 int
+
 
     def __init__(self):
         super().__init__()
@@ -1106,6 +1524,73 @@ class LeftToolbar(QtWidgets.QFrame):
         self.btnOpenMask = QtWidgets.QPushButton("Open Mask")
         self.btnOpenMask.clicked.connect(lambda: self.openMaskRequested.emit())
         lay.addWidget(self.btnOpenMask)
+
+        # --- 编辑工具 ---
+        sep = QtWidgets.QFrame(); sep.setFrameShape(QtWidgets.QFrame.HLine)
+        lay.addWidget(sep)
+
+        self.chkEdit = QtWidgets.QCheckBox("Edit Mask")
+        self.chkEdit.toggled.connect(self.editModeToggled.emit)
+        lay.addWidget(self.chkEdit)
+
+        # 工具模式
+        self.grpTool = QtWidgets.QButtonGroup(self)
+        radBrush = QtWidgets.QRadioButton("Brush")
+        radPoly  = QtWidgets.QRadioButton("Polygon")
+        radBrush.setChecked(True)
+        self.grpTool.addButton(radBrush, 0)   # 0=BRUSH
+        self.grpTool.addButton(radPoly, 1)    # 1=POLY
+        lay.addWidget(radBrush)
+        lay.addWidget(radPoly)
+
+        # self.toolModeChanged = QtCore.Signal(int)  # <- 类属性最上面声明
+        # self.grpTool.idClicked.connect(self.toolModeChanged.emit)
+        self.grpTool.idClicked.connect(lambda i: self.toolModeChanged.emit(int(i)))
+
+        
+        # 笔刷半径
+        rowB = QtWidgets.QHBoxLayout()
+        rowB.addWidget(QtWidgets.QLabel("Brush R"))
+        self.sldBrush = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.sldBrush.setRange(1, 50); self.sldBrush.setValue(8)
+        self.sldBrush.valueChanged.connect(self.brushSizeChanged.emit)
+        rowB.addWidget(self.sldBrush, 1)
+        lay.addLayout(rowB)
+
+        # 两行颜色选择：1) 笔刷显示色（仅指示），2) 作用标签（决定加/删）
+        # 用下拉列出 “Blank(0), Label 1, Label 2, ...”
+        self.cmbBrushColor = QtWidgets.QComboBox()
+        self.cmbApplyLabel = QtWidgets.QComboBox()
+        
+        # lay.addWidget(QtWidgets.QLabel("Brush Color"))
+        # lay.addWidget(self.cmbBrushColor)
+        # lay.addWidget(QtWidgets.QLabel("Apply To (Label)"))
+        # lay.addWidget(self.cmbApplyLabel)
+        # self.cmbApplyLabel.currentIndexChanged.connect(self._emit_label_changed)
+
+        lay.addWidget(QtWidgets.QLabel("Brush Label"))   # 原 Brush Color
+        lay.addWidget(self.cmbBrushColor)
+        lay.addWidget(QtWidgets.QLabel("Apply To"))
+        lay.addWidget(self.cmbApplyLabel)
+
+        self.cmbBrushColor.currentIndexChanged.connect(
+            lambda: self.brushLabelChanged.emit(self.cmbBrushColor.currentData())
+        )
+        self.cmbApplyLabel.currentIndexChanged.connect(
+            lambda: self.applyFilterChanged.emit(self.cmbApplyLabel.currentData())
+        )
+
+
+        # 撤销/重做/保存
+        btnRow = QtWidgets.QHBoxLayout()
+        self.btnUndo = QtWidgets.QPushButton("Undo")
+        self.btnRedo = QtWidgets.QPushButton("Redo")
+        self.btnSave = QtWidgets.QPushButton("Save Mask")
+        self.btnUndo.clicked.connect(self.undoRequested.emit)
+        self.btnRedo.clicked.connect(self.redoRequested.emit)
+        self.btnSave.clicked.connect(self.saveMaskRequested.emit)
+        btnRow.addWidget(self.btnUndo); btnRow.addWidget(self.btnRedo); btnRow.addWidget(self.btnSave)
+        lay.addLayout(btnRow)
 
         
         self.spnLevel = QtWidgets.QDoubleSpinBox()
@@ -1152,6 +1637,13 @@ class LeftToolbar(QtWidgets.QFrame):
         lay.addWidget(radImageMasked)
 
         lay.addStretch(1)
+
+
+    def _emit_label_changed(self):
+        lab = self.cmbApplyLabel.currentData()
+        if lab is not None:
+            self.brushLabelChanged.emit(int(lab))
+
 
 class MiddleColumn(QtWidgets.QFrame):
     """Center column: three previews stacked vertically + a single global slice slider + plane selector."""
@@ -1282,44 +1774,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Left toolbar
         self.left = LeftToolbar()
-        self.left.openRequested.connect(self._open_file)
-        
-        self.left.spnLevel.valueChanged.connect(
-            lambda v: self.volume.set_window(v, self.left.spnWidth.value())
-        )
-        self.left.spnWidth.valueChanged.connect(
-            lambda v: self.volume.set_window(self.left.spnLevel.value(), v)
-        )
-
-
-        self.left.openMaskRequested.connect(self._open_mask)
-
-        # Mask 透明度
-        self.left.sldMaskAlpha.valueChanged.connect(
-            lambda v: self.volume.set_mask_alpha(v / 100.0)
-        )
-
-        # 显示模式
-
-        def _on_mode_changed(id_):
-            mode = {
-                0: "overlay",
-                1: "image_only",
-                2: "mask_only",
-                3: "image_masked",
-            }.get(id_, "overlay")
-            self.volume.set_display_mode(mode)
-
-
-        self.left.grpMode.idClicked.connect(_on_mode_changed)
 
         # Middle previews
         self.middle = MiddleColumn(self.volume)
-        self.middle.zoomRequested.connect(self._promote_preview)
-
-        # Right detail view
-        # self.right = DetailView(self.volume)
-
+        
         # 右侧：2D + 3D 堆叠
         self.right2d = DetailView(self.volume)
         self.right3d = DetailView3D()
@@ -1327,9 +1785,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.rightStack.addWidget(self.right2d)   # index 0
         self.rightStack.addWidget(self.right3d)   # index 1
         self.rightStack.setCurrentIndex(0)
-
-
-
 
         # Arrange columns using a central widget with a grid
         central = QtWidgets.QWidget()
@@ -1352,6 +1807,63 @@ class MainWindow(QtWidgets.QMainWindow):
         # Status bar
         self.status = self.statusBar()
         self._update_status("Ready")
+
+        # ---------- 3) 信号连接（统一放在这里，顺序清晰） ----------
+
+        self.left.openRequested.connect(self._open_file)
+        self.left.openMaskRequested.connect(self._open_mask)
+
+        # WL/WW 
+        self.left.spnLevel.valueChanged.connect(
+            lambda v: self.volume.set_window(v, self.left.spnWidth.value())
+        )
+        self.left.spnWidth.valueChanged.connect(
+            lambda v: self.volume.set_window(self.left.spnLevel.value(), v)
+        )
+
+        # Mask 透明度
+        self.left.sldMaskAlpha.valueChanged.connect(
+            lambda v: self.volume.set_mask_alpha(v / 100.0)
+        )
+
+
+        # 显示模式
+
+        def _on_mode_changed(id_):
+            mode = {
+                0: "overlay",
+                1: "image_only",
+                2: "mask_only",
+                3: "image_masked",
+            }.get(id_, "overlay")
+            self.volume.set_display_mode(mode)
+        self.left.grpMode.idClicked.connect(_on_mode_changed)
+
+
+        # —— 左侧编辑工具联动 —— # TODO 整理这部分的顺序
+        # 1) 开关编辑
+        self.left.editModeToggled.connect(self._on_edit_toggled)
+        # 2) 画笔半径（现在 right2d 已存在，连接是安全的）
+        self.left.brushSizeChanged.connect(lambda r: self.right2d.set_brush_radius(r))
+        # 3) Brush = 写成哪个标签
+        self.left.brushLabelChanged.connect(self.volume.set_brush_label)
+        # self.left.brushLabelChanged.connect(self._on_brush_label_changed)
+        # 4) ApplyTo = 只作用于哪个旧标签（None=All）
+        self.left.applyFilterChanged.connect(self.volume.set_apply_only_label)
+        # 5) 工具模式（Brush / Polygon 等）
+        self.left.toolModeChanged.connect(self.right2d.set_tool_mode)
+        # 6) 撤销/重做/保存
+        self.left.undoRequested.connect(lambda: self.volume.undo())
+        self.left.redoRequested.connect(lambda: self.volume.redo())
+        self.left.saveMaskRequested.connect(self._on_save_mask)
+        # 中列预览 -> 右侧放大
+        self.middle.zoomRequested.connect(self._promote_preview)
+
+        # 初始把“作用标签”下拉填充（在加载 mask 后会再次刷新）
+        self._refresh_label_combos()
+
+
+
 
     # ---------- Slots ----------
     def _update_status(self, text: str):
@@ -1379,22 +1891,13 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         try:
             self.volume.load_mask(path)
+            self._refresh_label_combos() 
             self._update_status(f"Loaded mask: {os.path.basename(path)}")
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Load Mask Error", str(e))
             self._update_status("Load mask failed")
 
 
-    # def _promote_preview(self, preview):
-
-
-    #     if hasattr(preview, "view") and isinstance(preview.view, gl.GLViewWidget):
-    #         QtWidgets.QMessageBox.information(self, "3D Promote",
-    #             "当前右侧大图为2D视图。\n下一步我可以为你加一个右侧3D大图模式（可缩放旋转）。")
-    #         return
-    #     self.right.promote_from(preview.plane, preview.img_item, preview.view)
-
-    #     self._update_status(f"Detail view: {preview.plane}")
     def _promote_preview(self, preview):
         # 3D 预览：放大到右侧 3D
         if isinstance(preview, Volume3DPreview):
@@ -1412,6 +1915,84 @@ class MainWindow(QtWidgets.QMainWindow):
         self.right2d.promote_from(preview.plane, preview.img_item, preview.view)
         self.rightStack.setCurrentIndex(0)
         self._update_status(f"Detail view: {preview.plane}")
+
+
+    def _on_edit_toggled(self, on: bool):
+        self.right2d.set_edit_enabled(on)
+
+    def _on_brush_label_changed(self, lab: int):
+        self.volume.set_brush_label(lab)
+
+    def _on_save_mask(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save Mask as NIfTI", os.getcwd(), "NIfTI (*.nii *.nii.gz)"
+        )
+        if not path:
+            return
+        try:
+            self.volume.save_mask(path)
+            self._update_status(f"Saved mask: {os.path.basename(path)}")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Save Mask Error", str(e))
+
+    # def _refresh_label_combos(self):
+    #     """根据当前 LUT 填充分类颜色列表。"""
+    #     lut = self.volume._lut_colors
+    #     self.left.cmbBrushColor.clear()
+    #     self.left.cmbApplyLabel.clear()
+    #     if lut is None:
+    #         # 至少有 Background(0) 和 Label 1 作为示例
+    #         items = [(0, (0,0,0,0)), (1, (255,0,0,255))]
+    #     else:
+    #         items = [(i, tuple(lut[i])) for i in range(lut.shape[0])]
+    #     # 填充
+    #     for i, rgba in items:
+    #         pix = QtGui.QPixmap(16,16); pix.fill(QtGui.QColor(rgba[0], rgba[1], rgba[2], rgba[3]))
+    #         icon = QtGui.QIcon(pix)
+    #         text = "Blank (0)" if i==0 else f"Label {i}"
+    #         self.left.cmbBrushColor.addItem(icon, text, userData=i)
+    #         self.left.cmbApplyLabel.addItem(icon, text, userData=i)
+    #     # 默认“作用标签”用 1
+    #     idx1 = self.left.cmbApplyLabel.findData(1)
+    #     if idx1 >= 0:
+    #         self.left.cmbApplyLabel.setCurrentIndex(idx1)
+    #         self.volume.set_brush_label(1)
+
+
+    def _refresh_label_combos(self):
+        lut = self.volume._lut_colors
+        self.left.cmbBrushColor.clear()
+        self.left.cmbApplyLabel.clear()
+
+        # Brush：列出 0..K-1（0=Blank 擦除）
+        if lut is None:
+            items = [(0, (0,0,0,0)), (1, (255,0,0,255))]
+        else:
+            items = [(i, tuple(lut[i])) for i in range(lut.shape[0])]
+
+        for i, rgba in items:
+            pix = QtGui.QPixmap(16,16); pix.fill(QtGui.QColor(*rgba))
+            icon = QtGui.QIcon(pix)
+            text = "Blank (0)" if i==0 else f"Label {i}"
+            self.left.cmbBrushColor.addItem(icon, text, userData=i)
+
+        # ApplyTo：首项 All labels（userData=None），之后 0..K-1
+        self.left.cmbApplyLabel.addItem("All labels", userData=None)
+        for i, rgba in items:
+            pix = QtGui.QPixmap(16,16); pix.fill(QtGui.QColor(*rgba))
+            icon = QtGui.QIcon(pix)
+            text = "Blank (0)" if i==0 else f"Label {i}"
+            self.left.cmbApplyLabel.addItem(icon, text, userData=i)
+
+        # 默认：Brush=1，ApplyTo=All
+        idx1 = self.left.cmbBrushColor.findData(1)
+        if idx1 >= 0: 
+            self.left.cmbBrushColor.setCurrentIndex(idx1)
+            self.volume.set_brush_label(1)
+
+        self.left.cmbApplyLabel.setCurrentIndex(0)   # All labels
+        self.volume.set_apply_only_label(None)
+
 
 # ------------------------ Entry ------------------------
 if __name__ == "__main__":
