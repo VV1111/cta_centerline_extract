@@ -70,12 +70,79 @@ class VolumeData(QtCore.QObject):
 
         self._undo_stack = []          # list[dict] 每个动作的稀疏 diff
         self._redo_stack = []
-        self._undo_capacity = 20      
+        self._undo_capacity = 20        
         
         # 画笔当前目标标签（由 UI 设置；0=背景=删除）
         self.brush_label = 1              # 写成哪个标签
         self.apply_only_label = None      # None=All；否则仅当旧值==此标签时才改
 
+        # self.centerline_mask = None      # (Z,Y,X) uint8, 0/1
+        # self.centerline_snakes = []      # 用于导出 YAML
+        # self.centerline_rois = {}        # 用于导出 YAML
+        # self.centerline_display_mode = "off"   # 'off' | 'overlay' | 'only'
+        self._centerline = None      # 3D 二值/整型体素，形状 = vol.shape；>0 表示 centerline
+        self._cl_color = (255, 80, 80, 255)  # 叠加颜色（可做成可配置）    
+        self.show_centerline = True    
+
+
+    def set_centerline_visible(self, on: bool):
+        on = bool(on)
+        if on != self.show_centerline:
+            self.show_centerline = on
+            self.paramsChanged.emit()
+
+
+    # === centerline 数据入口（体素版）===
+    def set_centerline_mask(self, cl_vol: np.ndarray):
+        """cl_vol: 与 _vol 同形状的 3D 数组（bool, uint8, int 都可），>0 为 centerline。"""
+        if cl_vol is None:
+            self._centerline = None
+        else:
+            arr = np.asarray(cl_vol)
+            if self._vol is None or arr.shape != self._vol.shape:
+                raise ValueError(f"Centerline shape {arr.shape} must match image shape {self._vol.shape if self._vol is not None else None}")
+            self._centerline = (arr > 0).astype(np.uint8)
+        self.paramsChanged.emit()
+
+    def has_centerline(self) -> bool:
+        return self._centerline is not None
+
+    def get_centerline_slice(self, plane: str, idx: int) -> np.ndarray | None:
+        if not self.has_centerline():
+            return None
+        z, y, x = self._centerline.shape
+        if plane == "Axial":
+            idx = np.clip(idx, 0, z-1); return self._centerline[idx, :, :]
+        if plane == "Coronal":
+            idx = np.clip(idx, 0, y-1); return self._centerline[:, idx, :]
+        if plane == "Sagittal":
+            idx = np.clip(idx, 0, x-1); return self._centerline[:, :, idx]
+        return None
+
+    def render_centerline_rgba_slice(self, plane: str, idx: int) -> np.ndarray | None:
+        """
+        把 centerline 切片渲染成 RGBA(H,W,4)，背景 alpha=0，线条用 self._cl_color。
+        注意：返回值**不转置**；前端按你现在的习惯做 transpose。
+        """
+        sl = self.get_centerline_slice(plane, idx)
+        if sl is None:
+            return None
+        h, w = sl.shape
+        rgba = np.zeros((h, w, 4), dtype=np.uint8)
+        if np.any(sl):
+            r, g, b, a = self._cl_color
+            rgba[..., 0][sl > 0] = r
+            rgba[..., 1][sl > 0] = g
+            rgba[..., 2][sl > 0] = b
+            rgba[..., 3][sl > 0] = a
+        return rgba
+
+    # （可选）矢量版入口：把一条条 3D 折线投影到各切片，渲染成 2D 位图或直接返回点集。
+    # 先占位：等你 YAML/rois 的坐标定义定了，我们一起接。
+    def set_centerline_vectors(self, list_of_polylines_zyx):
+        """list_of_polylines_zyx: [N_i x 3] 的多段，坐标单位=体素 index (z,y,x)。先占位。"""
+        self._centerline_vectors = list_of_polylines_zyx
+        self.paramsChanged.emit()
 
 
 
@@ -371,11 +438,12 @@ class VolumeData(QtCore.QObject):
 
     def set_display_mode(self, mode: str):
         mode = mode.lower()
-        if mode not in ("overlay", "image_only", "mask_only", "image_masked"):
+        if mode not in ("overlay", "image_only", "mask_only", "image_masked", "centerline_only"):  # + centerline_only
             mode = "overlay"
         if mode != self.display_mode:
             self.display_mode = mode
             self.paramsChanged.emit()
+
 
     def has_mask(self) -> bool:
         return self._mask is not None
@@ -540,11 +608,7 @@ class ImagePreview(QtWidgets.QFrame):
         self.btnZoom = QtWidgets.QToolButton()
         self.btnZoom.setText("🔍")
         self.btnZoom.setToolTip("Show this plane in the large view")
-        # self.btnZoom.clicked.connect(lambda: self.zoomRequested.emit(self.plane))
         self.btnZoom.clicked.connect(lambda: self.zoomRequested.emit(self))
-        # title.addWidget(self.lbl)
-        # title.addWidget(self.hdrSlider, 1) 
-        # title.addWidget(self.btnZoom)
 
         title.addWidget(self.lbl)
 
@@ -566,6 +630,12 @@ class ImagePreview(QtWidgets.QFrame):
         self.mask_item.setZValue(10)
         self.view.addItem(self.mask_item)
 
+        self.centerline_item = pg.ImageItem()
+        self.centerline_item.setZValue(15)
+        self.view.addItem(self.centerline_item)
+        self.centerline_item.setVisible(False)
+
+
         # Local slice slider for this preview (hidden; we use global slider primarily)
         self.slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.slider.setMinimum(0)
@@ -583,6 +653,21 @@ class ImagePreview(QtWidgets.QFrame):
         
         self.volume.dataChanged.connect(self.refresh)
         self.volume.paramsChanged.connect(self.refresh)
+
+
+
+    def _update_centerline_layer(self, idx: int):
+        # 复选框控制
+        if not self.volume.show_centerline:
+            self.centerline_item.setVisible(False)
+            return
+        rgba = self.volume.render_centerline_rgba_slice(self.plane, idx)
+        if rgba is None or rgba[...,3].max() == 0:
+            self.centerline_item.setVisible(False)
+            return
+        # 统一遵循你现在的显示约定：可视时做转置
+        self.centerline_item.setImage(rgba.transpose(1,0,2), autoLevels=False)
+        self.centerline_item.setVisible(True)
 
 
     def _on_local_slider_changed(self, v: int):
@@ -617,6 +702,14 @@ class ImagePreview(QtWidgets.QFrame):
                 self.view.autoRange()
             # 该模式下不显示彩色 mask 覆盖
             self.mask_item.setVisible(False)
+        elif mode == "centerline_only":
+            # 仍然更新底图（用于坐标映射和视域），但隐藏它
+            base = self.volume.render_slice(self.plane, idx)
+            if base is not None:
+                self.img_item.setImage(base.T, autoLevels=False, levels=(0.0, 1.0))
+            self.img_item.setVisible(False)
+            self.mask_item.setVisible(False)
+
         else:
             # 正常原图
             img = self.volume.render_slice(self.plane, idx)
@@ -626,7 +719,8 @@ class ImagePreview(QtWidgets.QFrame):
                 self.view.autoRange()
             # 叠加/仅 mask / 仅图 由这个函数处理
             self._update_mask_layer(idx)
-                
+        self._update_centerline_layer(idx)
+
         
         
         
@@ -675,240 +769,32 @@ class ImagePreview(QtWidgets.QFrame):
             # 只显示 mask 区域的原图
             img = self.volume.render_image_masked_slice(self.plane, idx)
             if img is not None:
-                # self.img_item.setImage(img.T, autoLevels=False, levels=(0.0, 1.0))
-                self.img_item.setImage(img, autoLevels=False, levels=(0.0, 1.0))
+                self.img_item.setImage(img.T, autoLevels=False, levels=(0.0, 1.0))
+                # self.img_item.setImage(img, autoLevels=False, levels=(0.0, 1.0))
 
                 self.view.autoRange()
             # 该模式下不显示彩色 mask 覆盖
             self.mask_item.setVisible(False)
+
+        elif mode == "centerline_only":
+            # 仍然更新底图（用于坐标映射和视域），但隐藏它
+            base = self.volume.render_slice(self.plane, idx)
+            if base is not None:
+                self.img_item.setImage(base.T, autoLevels=False, levels=(0.0, 1.0))
+            self.img_item.setVisible(False)
+            self.mask_item.setVisible(False)
+
         else:
             # 正常原图
             img = self.volume.render_slice(self.plane, idx)
             if img is not None:
-                # self.img_item.setImage(img.T, autoLevels=False, levels=(0.0, 1.0))
-                self.img_item.setImage(img, autoLevels=False, levels=(0.0, 1.0))
+                self.img_item.setImage(img.T, autoLevels=False, levels=(0.0, 1.0))
+                # self.img_item.setImage(img, autoLevels=False, levels=(0.0, 1.0))
 
                 self.view.autoRange()
             # 叠加/仅 mask / 仅图 由这个函数处理
             self._update_mask_layer(idx)
-
-
-# class Volume3DPreview(QtWidgets.QFrame):
-#     """按需渲染的3D体视图。默认显示占位图；点击 Update 后才生成体素并显示 3D。"""
-#     zoomRequested = QtCore.Signal(object)
-
-#     def __init__(self, volume: VolumeData, title="3D"):
-#         super().__init__()
-#         self.volume = volume
-#         self.setFrameShape(QtWidgets.QFrame.StyledPanel)
-#         self.setFrameShadow(QtWidgets.QFrame.Raised)
-
-#         # --- 标题行：3D | Update | 🔍 ---
-#         top = QtWidgets.QHBoxLayout()
-#         self.lbl = QtWidgets.QLabel(title)
-#         self.lbl.setStyleSheet("font-weight: 600;")
-
-#         self.btnUpdate = QtWidgets.QToolButton()
-#         self.btnUpdate.setText("Update")
-#         self.btnUpdate.setToolTip("Generate 3D preview with current mode")
-#         self.btnUpdate.clicked.connect(self.regenerate)
-
-#         self.btnZoom = QtWidgets.QToolButton()
-#         self.btnZoom.setText("🔍")
-#         self.btnZoom.setToolTip("Show this 3D view in the large view")
-#         self.btnZoom.clicked.connect(lambda: self.zoomRequested.emit(self))
-
-#         top.addWidget(self.lbl)
-#         top.addStretch(1)
-#         top.addWidget(self.btnUpdate)
-#         top.addWidget(self.btnZoom)
-
-#         # --- 占位页（Page 0）：显示一张轻量图 ---
-#         self.ph_glw = pg.GraphicsLayoutWidget()
-#         self.ph_vb = self.ph_glw.addViewBox(lockAspect=True, enableMenu=False)
-#         self.ph_vb.setMouseEnabled(x=False, y=False)
-#         self.ph_img = pg.ImageItem()
-#         self.ph_vb.addItem(self.ph_img)
-#         # 初始 levels 固定到 [0,1]
-#         self.ph_img.setLevels((0.0, 1.0))
-
-#         # --- 3D 页（Page 1）：GLViewWidget ---
-#         self.view3d = gl.GLViewWidget()
-#         self.view3d.opts["distance"] = 200
-#         self.view3d.setBackgroundColor(30, 30, 30)
-#         self.vol_item = None
-#         self._last_rgba = None
-
-#         # --- 堆栈：默认显示占位页 ---
-#         self.stack = QtWidgets.QStackedLayout()
-#         self.stack.addWidget(self.ph_glw)   # index 0
-#         self.stack.addWidget(self.view3d)   # index 1
-#         self.stack.setCurrentIndex(0)
-
-#         lay = QtWidgets.QVBoxLayout(self)
-#         lay.setContentsMargins(6, 6, 6, 6)
-#         lay.addLayout(top)
-#         lay.addLayout(self.stack)
-
-#         # 数据/参数变化：只刷新占位图（不做 3D 重建）
-#         self.volume.dataChanged.connect(self._refresh_placeholder)
-#         self.volume.paramsChanged.connect(self._refresh_placeholder)
-
-#         # 首次占位刷新
-#         self._refresh_placeholder()
-
-#     def _refresh_placeholder(self):
-#         """根据当前显示模式，生成一张轻量级占位图（不触发 3D 体渲染）。"""
-#         if not self.volume.is_loaded():
-#             self.ph_img.clear()
-#             return
-
-#         # 取中间层的 Axial 切片做示意；尽量与当前显示模式一致
-#         z, _, _ = self.volume.shape_zyx()
-#         idx = max(0, z // 2)
-
-#         mode = self.volume.display_mode
-#         if mode == "image_masked":
-#             base = self.volume.render_image_masked_slice("Axial", idx)
-#             if base is None:
-#                 self.ph_img.clear(); return
-#             self.ph_img.setImage(base.T, autoLevels=False, levels=(0.0, 1.0))
-#             return
-
-#         # 其他模式：先画灰度底
-#         base = self.volume.render_slice("Axial", idx)
-#         if base is None:
-#             self.ph_img.clear(); return
-#         self.ph_img.setImage(base.T, autoLevels=False, levels=(0.0, 1.0))
-
-#         # 若需要叠彩色 mask
-#         if mode in ("overlay", "mask_only") and self.volume.has_mask():
-#             rgba = self.volume.render_mask_rgba_slice("Axial", idx)  # (H,W,4) uint8
-#             if rgba is not None:
-#                 # 把彩色 mask 直接画到同一 ImageItem 上会被覆盖；
-#                 # 这里做一次简单的 alpha 合成，得到一张 RGB 灰度（0~1）
-#                 over = self._alpha_blend_gray_rgba(base, rgba)  # 返回 0~1 float
-#                 self.ph_img.setImage(over.T, autoLevels=False, levels=(0.0, 1.0))
-#         # 若是 image_only，就只显示灰度
-#         self.ph_vb.autoRange()
-
-#     @staticmethod
-#     def _alpha_blend_gray_rgba(gray01: np.ndarray, rgba: np.ndarray) -> np.ndarray:
-#         """把 [0,1] 灰度图与 uint8 RGBA 做前景覆盖，返回 [0,1] 的近似合成结果（只为占位显示）。"""
-#         g = np.clip(gray01, 0.0, 1.0).astype(np.float32)
-#         rgb = rgba[..., :3].astype(np.float32) / 255.0
-#         a   = rgba[..., 3].astype(np.float32) / 255.0
-#         # 简单"over"合成：out = fg*a + bg*(1-a)
-#         out_rgb = rgb * a[..., None] + g[..., None] * (1.0 - a[..., None])
-#         # 取亮度近似（平均）转回灰度以节省绘制
-#         out_g = out_rgb.mean(axis=-1)
-#         return np.clip(out_g, 0.0, 1.0).astype(np.float32)
-
-
-#     def clear(self):
-#         if self.vol_item is not None:
-#             try:
-#                 self.view3d.removeItem(self.vol_item)
-#             except Exception:
-#                 pass
-#             self.vol_item = None
-#         self._last_rgba = None
-#         self.stack.setCurrentIndex(0)  # 回到占位页
-
-#     def regenerate(self):
-#         if not self.volume.is_loaded():
-#             self.clear()
-#             return
-#         rgba = self._build_rgba_from_current()
-#         self._last_rgba = rgba
-
-#         if self.vol_item is not None:
-#             try:
-#                 self.view3d.removeItem(self.vol_item)
-#             except Exception:
-#                 pass
-#             self.vol_item = None
-
-#         self.vol_item = gl.GLVolumeItem(rgba, smooth=True)
-#         self.vol_item.setGLOptions('translucent')
-#         self.view3d.addItem(self.vol_item)
-#         self.stack.setCurrentIndex(1) 
-
-#     def export_rgba(self):
-#         """把最近一次生成的 RGBA 体素导出，供右侧 3D 大图使用。"""
-#         return self._last_rgba
-
-#     # ---------- helpers ----------
-#     def _normalize_volume(self, vol: np.ndarray) -> np.ndarray:
-#         L, W = self.volume.window_level, self.volume.window_width
-#         if L is not None and W is not None:
-#             lo, hi = float(L) - float(W) * 0.5, float(L) + float(W) * 0.5
-#         else:
-#             gmin = self.volume._gmin if self.volume._gmin is not None else float(np.nanmin(vol))
-#             gmax = self.volume._gmax if self.volume._gmax is not None else float(np.nanmax(vol))
-#             if not np.isfinite(gmin) or not np.isfinite(gmax) or gmax <= gmin:
-#                 gmin, gmax = 0.0, 1.0
-#             lo, hi = gmin, gmax
-#         out = (vol.astype(np.float32) - lo) / max(1e-6, (hi - lo))
-#         out = np.clip(out, 0.0, 1.0)
-#         return np.nan_to_num(out, nan=0.0, posinf=1.0, neginf=0.0)
-
-#     def _build_rgba_from_current(self) -> np.ndarray:
-#         """根据 display_mode 构建 (X,Y,Z,4) RGBA 体素。"""
-#         vol = self.volume._vol
-#         norm = self._normalize_volume(vol)               # (Z,Y,X) in [0,1]
-#         mode = self.volume.display_mode
-#         has_mask = self.volume.has_mask()
-
-#         if mode == "image_only" or (mode == "image_masked" and not has_mask):
-#             # 灰度体素 + 强度alpha
-#             rgb = (norm * 255).astype(np.ubyte)
-#             a   = (norm * 0.6 * 255).astype(np.ubyte)
-
-#             rgba = np.stack([rgb, rgb, rgb, a], axis=-1)         # (Z,Y,X,4)
-
-#         elif mode == "image_masked" and has_mask:
-#             lab = self.volume._mask
-#             m = (lab > 0).astype(np.float32)
-#             rgb = (norm * m * 255).astype(np.ubyte)
-#             a   = (norm * m * 0.6 * 255).astype(np.ubyte)
-#             rgba = np.stack([rgb, rgb, rgb, a], axis=-1)
-
-#         elif mode == "mask_only" and has_mask:
-#             lab = np.asarray(self.volume._mask, dtype=np.int32)   # (Z,Y,X)
-#             lut = self.volume._lut_colors
-#             K = lut.shape[0]
-#             lab_clip = np.clip(lab, 0, K-1)
-#             rgba = lut[lab_clip].astype(np.ubyte)                 # (Z,Y,X,4)
-#             # 全局 alpha（叠一层系数，让体渲染更柔和）
-#             if self.volume.mask_alpha < 1.0:
-#                 a = (rgba[..., 3].astype(np.float32) * self.volume.mask_alpha).clip(0,255).astype(np.ubyte)
-#                 rgba = rgba.copy()
-#                 rgba[..., 3] = a
-
-#         else:
-#             # overlay: 用灰度作底，mask>0 区域微微上色/加透明度
-#             rgb = (norm * 255).astype(np.ubyte)
-#             a   = (norm * 0.4 * 255).astype(np.ubyte)      # 底层 alpha
-#             rgba = np.stack([rgb, rgb, rgb, a], axis=-1)
-
-#             if has_mask and self.volume._lut_colors is not None:
-#                 lab = np.asarray(self.volume._mask, dtype=np.int32)
-#                 K = self.volume._lut_colors.shape[0]
-#                 lab_clip = np.clip(lab, 0, K-1)
-#                 color = self.volume._lut_colors[lab_clip]  # (Z,Y,X,4)
-#                 # 简单混色：mask像素提亮并增加alpha
-#                 mask_on = (lab_clip > 0)
-#                 rgba = rgba.copy()
-#                 rgba[..., 0][mask_on] = np.maximum(rgba[..., 0][mask_on], color[..., 0][mask_on])
-#                 rgba[..., 1][mask_on] = np.maximum(rgba[..., 1][mask_on], color[..., 1][mask_on])
-#                 rgba[..., 2][mask_on] = np.maximum(rgba[..., 2][mask_on], color[..., 2][mask_on])
-#                 add_a = int(255 * 0.25 * self.volume.mask_alpha)
-#                 rgba[..., 3][mask_on] = np.clip(rgba[..., 3][mask_on].astype(np.int16) + add_a, 0, 255).astype(np.ubyte)
-
-#         # (Z,Y,X,4) -> (X,Y,Z,4)
-#         rgba = np.transpose(rgba, (2, 1, 0, 3)).copy(order='C')
-#         return rgba
+        self._update_centerline_layer(idx)
 
 class Volume3DPreview(QtWidgets.QFrame):
     """真正的3D小预览：默认空（黑底，不渲染）；点击 Update 后在小窗直接体渲染。"""
@@ -1015,11 +901,22 @@ class Volume3DPreview(QtWidgets.QFrame):
         norm = self._normalize_volume(vol)               # (Z,Y,X) in [0,1]
         mode = self.volume.display_mode
         has_mask = self.volume.has_mask()
+        has_cl = self.volume.has_centerline()
 
         if mode == "image_only" or (mode == "image_masked" and not has_mask):
             rgb = (norm * 255).astype(np.ubyte)
             a   = (norm * 0.6 * 255).astype(np.ubyte)
             rgba = np.stack([rgb, rgb, rgb, a], axis=-1)
+
+        elif mode == "centerline_only" and has_cl:
+            cl = (self.volume._centerline > 0)
+            r, g, b, a = self.volume._cl_color
+            R = np.zeros_like(norm, dtype=np.ubyte)
+            G = np.zeros_like(norm, dtype=np.ubyte)
+            B = np.zeros_like(norm, dtype=np.ubyte)
+            A = np.zeros_like(norm, dtype=np.ubyte)
+            R[cl] = r; G[cl] = g; B[cl] = b; A[cl] = 255
+            rgba = np.stack([R, G, B, A], axis=-1)  # (Z,Y,X,4)
 
         elif mode == "image_masked" and has_mask:
             lab = self.volume._mask
@@ -1105,9 +1002,25 @@ class DetailView(QtWidgets.QFrame):
         self.glw = pg.GraphicsLayoutWidget()
         self.view = self.glw.addViewBox(lockAspect=True, enableMenu=False)
         self.view.setMouseEnabled(x=True, y=True)
-        self.img_item = pg.ImageItem()
+        
+        # self.img_item = pg.ImageItem()
+        # self.view.addItem(self.img_item)
+        # self.img_item.setLevels((0.0, 1.0))
+
+
+        # self.mask_item = pg.ImageItem()
+        # self.mask_item.setZValue(10)
+        # self.view.addItem(self.mask_item)
+
+        self.img_item  = pg.ImageItem()
+        self.mask_item = pg.ImageItem(); self.mask_item.setZValue(10)
+        self.centerline_item = pg.ImageItem(); self.centerline_item.setZValue(15)
+
         self.view.addItem(self.img_item)
-        self.img_item.setLevels((0.0, 1.0))
+        self.view.addItem(self.mask_item)
+        self.view.addItem(self.centerline_item)
+        self.centerline_item.setVisible(False)
+
 
 
         # 让视图能接收键盘焦点
@@ -1115,11 +1028,7 @@ class DetailView(QtWidgets.QFrame):
         self.glw.setFocusPolicy(QtCore.Qt.StrongFocus)
         self.view.setFocusPolicy(QtCore.Qt.StrongFocus)
 
-
-        self.mask_item = pg.ImageItem()
-        self.mask_item.setZValue(10)
-        self.view.addItem(self.mask_item)
-        
+     
                 
         # 编辑状态
         self._edit_enabled = False
@@ -1162,6 +1071,19 @@ class DetailView(QtWidgets.QFrame):
         self.glw.scene().installEventFilter(self)
 
 
+
+    def _update_centerline_layer(self, idx: int):
+        if not self.volume.show_centerline:
+            self.centerline_item.setVisible(False)
+            return
+        # rgba = self.volume.render_centerline_rgba_slice(self.active_plane, idx)
+        
+        rgba = self.volume.render_centerline_rgba_slice(self.active_plane, idx)
+        if rgba is None or rgba[...,3].max() == 0:
+            self.centerline_item.setVisible(False)
+            return
+        self.centerline_item.setImage(rgba.transpose(1,0,2), autoLevels=False)
+        self.centerline_item.setVisible(True)
 
     def set_tool_mode(self, mode: int):
         self._tool_mode = 0 if int(mode) == 0 else 1
@@ -1247,9 +1169,6 @@ class DetailView(QtWidgets.QFrame):
         h,w = sl.shape
         if 0 <= r < h and 0 <= c < w:
             self._poly_points.append((r,c))
-            # 画在可视坐标（注意 setImage 时做了转置，故绘制时要 (x,y)=(c,r)）
-            # xs = [p[1] for p in self._poly_points]
-            # ys = [p[0] for p in self._poly_points]
 
             xs = [p[0] for p in self._poly_points]  # row -> x
             ys = [p[1] for p in self._poly_points]  # col -> y
@@ -1352,7 +1271,19 @@ class DetailView(QtWidgets.QFrame):
             # 不显示彩色 mask
             self.mask_item.setVisible(False)
             self.img_item.setVisible(True)
+            self._update_centerline_layer(idx)
             return
+        
+        elif mode == "centerline_only":
+            base = self.volume.render_slice(self.active_plane, idx)
+            if base is not None:
+                self.img_item.setImage(base.T, autoLevels=False, levels=(0.0, 1.0))
+            # 仅显示中心线
+            self.img_item.setVisible(False)
+            self.mask_item.setVisible(False)
+            self._update_centerline_layer(idx)
+            return
+
         else:
             # 原图（正常）
             img = self.volume.render_slice(self.active_plane, idx)
@@ -1383,7 +1314,8 @@ class DetailView(QtWidgets.QFrame):
             self.img_item.setVisible(False)
         else:
             self.img_item.setVisible(True)
-
+            
+        self._update_centerline_layer(idx)
 
     def promote_from(self, plane: str, src_imgitem: pg.ImageItem, src_viewbox: pg.ViewBox):
         self.active_plane = plane
@@ -1448,10 +1380,6 @@ class DetailView3D(QtWidgets.QFrame):
         QShortcut(QKeySequence("Meta+0"), self, activated=self._reset_view)  # macOS
 
 
-    def _reset_view(self):
-        self.view.opts["distance"] = 200
-        self.view.orbit(0, 0)
-
     def show_rgba(self, rgba: np.ndarray):
         if rgba is None:
             return
@@ -1502,7 +1430,13 @@ class LeftToolbar(QtWidgets.QFrame):
     redoRequested = QtCore.Signal()
     toolModeChanged = QtCore.Signal(int)
     applyFilterChanged = QtCore.Signal(object)   # 传 None 或 int
+    
+    saveCenterlineYamlRequested = QtCore.Signal()
+    saveCenterlineNiftiRequested = QtCore.Signal()
 
+    # --- Centerline 相关 ---
+    computeCenterlineRequested = QtCore.Signal(str)   # method
+    centerlineVisibilityChanged = QtCore.Signal(bool) # show/hide
 
     def __init__(self):
         super().__init__()
@@ -1562,12 +1496,6 @@ class LeftToolbar(QtWidgets.QFrame):
         self.cmbBrushColor = QtWidgets.QComboBox()
         self.cmbApplyLabel = QtWidgets.QComboBox()
         
-        # lay.addWidget(QtWidgets.QLabel("Brush Color"))
-        # lay.addWidget(self.cmbBrushColor)
-        # lay.addWidget(QtWidgets.QLabel("Apply To (Label)"))
-        # lay.addWidget(self.cmbApplyLabel)
-        # self.cmbApplyLabel.currentIndexChanged.connect(self._emit_label_changed)
-
         lay.addWidget(QtWidgets.QLabel("Brush Label"))   # 原 Brush Color
         lay.addWidget(self.cmbBrushColor)
         lay.addWidget(QtWidgets.QLabel("Apply To"))
@@ -1624,25 +1552,59 @@ class LeftToolbar(QtWidgets.QFrame):
         radImage    = QtWidgets.QRadioButton("Image Only")
         radMaskOnly = QtWidgets.QRadioButton("Mask Only")
         radImageMasked = QtWidgets.QRadioButton("Image (masked)")
-
+        radCenterlineOnly = QtWidgets.QRadioButton("Centerline Only")
 
         radOverlay.setChecked(True)
         self.grpMode.addButton(radOverlay, 0)
         self.grpMode.addButton(radImage, 1)
         self.grpMode.addButton(radMaskOnly, 2)
         self.grpMode.addButton(radImageMasked, 3)
+        self.grpMode.addButton(radCenterlineOnly, 4)      # 新增 id=4
+
         lay.addWidget(radOverlay)
         lay.addWidget(radImage)
         lay.addWidget(radMaskOnly)
         lay.addWidget(radImageMasked)
+        lay.addWidget(radCenterlineOnly)
+
+        # ---- Centerline ----
+        sep2 = QtWidgets.QFrame(); sep2.setFrameShape(QtWidgets.QFrame.HLine)
+        lay.addWidget(sep2)
+
+        clTitle = QtWidgets.QLabel("Centerline"); clTitle.setStyleSheet("font-weight: 700;")
+        lay.addWidget(clTitle)
+
+        self.cmbCLMethod = QtWidgets.QComboBox()
+        self.cmbCLMethod.addItem("Baseline (3D skeletonize)", userData="baseline")
+        self.cmbCLMethod.addItem("VMTK (vmtkcenterlines)",     userData="vmtk")
+        lay.addWidget(self.cmbCLMethod)
+
+        self.btnComputeCL = QtWidgets.QPushButton("Compute Centerline")
+        lay.addWidget(self.btnComputeCL)
+
+        self.chkShowCL = QtWidgets.QCheckBox("Show Centerline")
+        self.chkShowCL.setChecked(True)
+        lay.addWidget(self.chkShowCL)
+
+        # 连接信号
+        self.btnComputeCL.clicked.connect(
+            lambda: self.computeCenterlineRequested.emit(self.cmbCLMethod.currentData())
+        )
+        self.chkShowCL.toggled.connect(self.centerlineVisibilityChanged.emit)
+
+        rowSave = QtWidgets.QHBoxLayout()
+        self.btnSaveCLYaml = QtWidgets.QPushButton("Save CL (YAML)")
+        self.btnSaveCLNii  = QtWidgets.QPushButton("Save CL (NIfTI)")
+        rowSave.addWidget(self.btnSaveCLYaml)
+        rowSave.addWidget(self.btnSaveCLNii)
+        lay.addLayout(rowSave)
+
+        # 连接信号
+        self.btnSaveCLYaml.clicked.connect(self.saveCenterlineYamlRequested.emit)
+        self.btnSaveCLNii.clicked.connect(self.saveCenterlineNiftiRequested.emit)
+
 
         lay.addStretch(1)
-
-
-    def _emit_label_changed(self):
-        lab = self.cmbApplyLabel.currentData()
-        if lab is not None:
-            self.brushLabelChanged.emit(int(lab))
 
 
 class MiddleColumn(QtWidgets.QFrame):
@@ -1835,12 +1797,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 1: "image_only",
                 2: "mask_only",
                 3: "image_masked",
+                4: "centerline_only", 
             }.get(id_, "overlay")
             self.volume.set_display_mode(mode)
         self.left.grpMode.idClicked.connect(_on_mode_changed)
 
 
-        # —— 左侧编辑工具联动 —— # TODO 整理这部分的顺序
+        # —— 左侧编辑工具联动 —— 
         # 1) 开关编辑
         self.left.editModeToggled.connect(self._on_edit_toggled)
         # 2) 画笔半径（现在 right2d 已存在，连接是安全的）
@@ -1858,10 +1821,48 @@ class MainWindow(QtWidgets.QMainWindow):
         self.left.saveMaskRequested.connect(self._on_save_mask)
         # 中列预览 -> 右侧放大
         self.middle.zoomRequested.connect(self._promote_preview)
+        # Centerline：触发与显示
+        self.left.computeCenterlineRequested.connect(self._on_compute_centerline)
+        self.left.centerlineVisibilityChanged.connect(self.volume.set_centerline_visible)
+        # saving
+        self.left.saveCenterlineYamlRequested.connect(self._on_save_centerline_yaml)
+        self.left.saveCenterlineNiftiRequested.connect(self._on_save_centerline_nii)
 
         # 初始把“作用标签”下拉填充（在加载 mask 后会再次刷新）
         self._refresh_label_combos()
 
+
+    def _on_save_centerline_yaml(self):
+        if not self.volume.has_centerline():
+            QtWidgets.QMessageBox.information(self, "Centerline", "没有可保存的 centerline，请先计算。")
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save Centerline (YAML)", os.getcwd(), "YAML (*.yaml *.yml)"
+        )
+        if not path:
+            return
+        try:
+            # 你 utils.centerline.save_centerline_yaml 的签名若不同，请在这里适配。
+            # 最常见：save_centerline_yaml(cl_mask, affine, yaml_path, radius_vox=2)
+            save_centerline_yaml(self.volume._centerline, self.volume._affine, path)
+            self._update_status(f"Saved centerline YAML: {os.path.basename(path)}")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Save YAML Error", str(e))
+
+    def _on_save_centerline_nii(self):
+        if not self.volume.has_centerline():
+            QtWidgets.QMessageBox.information(self, "Centerline", "没有可保存的 centerline，请先计算。")
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save Centerline (NIfTI)", os.getcwd(), "NIfTI (*.nii *.nii.gz)"
+        )
+        if not path:
+            return
+        try:
+            save_centerline_mask_nii(self.volume._centerline, self.volume._affine, path)
+            self._update_status(f"Saved centerline NIfTI: {os.path.basename(path)}")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Save NIfTI Error", str(e))
 
 
 
@@ -1896,6 +1897,23 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Load Mask Error", str(e))
             self._update_status("Load mask failed")
+
+
+    def _on_compute_centerline(self, method: str):
+        if not self.volume.has_mask():
+            QtWidgets.QMessageBox.information(self, "Centerline", "请先加载/生成 mask。")
+            return
+        try:
+            from utils.centerline import extract_centerline   # 你新建的单文件模块
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Centerline", f"导入 centerline 模块失败：{e}")
+            return
+        try:
+            cl = extract_centerline(self.volume._mask, method=method)
+            self.volume.set_centerline_mask(cl)
+            self._update_status(f"Centerline computed by {method}.")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Centerline", f"计算失败：{e}")
 
 
     def _promote_preview(self, preview):
@@ -1934,29 +1952,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._update_status(f"Saved mask: {os.path.basename(path)}")
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Save Mask Error", str(e))
-
-    # def _refresh_label_combos(self):
-    #     """根据当前 LUT 填充分类颜色列表。"""
-    #     lut = self.volume._lut_colors
-    #     self.left.cmbBrushColor.clear()
-    #     self.left.cmbApplyLabel.clear()
-    #     if lut is None:
-    #         # 至少有 Background(0) 和 Label 1 作为示例
-    #         items = [(0, (0,0,0,0)), (1, (255,0,0,255))]
-    #     else:
-    #         items = [(i, tuple(lut[i])) for i in range(lut.shape[0])]
-    #     # 填充
-    #     for i, rgba in items:
-    #         pix = QtGui.QPixmap(16,16); pix.fill(QtGui.QColor(rgba[0], rgba[1], rgba[2], rgba[3]))
-    #         icon = QtGui.QIcon(pix)
-    #         text = "Blank (0)" if i==0 else f"Label {i}"
-    #         self.left.cmbBrushColor.addItem(icon, text, userData=i)
-    #         self.left.cmbApplyLabel.addItem(icon, text, userData=i)
-    #     # 默认“作用标签”用 1
-    #     idx1 = self.left.cmbApplyLabel.findData(1)
-    #     if idx1 >= 0:
-    #         self.left.cmbApplyLabel.setCurrentIndex(idx1)
-    #         self.volume.set_brush_label(1)
 
 
     def _refresh_label_combos(self):

@@ -487,3 +487,36 @@ def save_centerline_yaml(
     }
     with open(path, "w") as f:
         yaml.safe_dump(data, f, sort_keys=False)
+
+
+
+def extract_centerline(mask3d: np.ndarray, method: str = "vmtk", **kwargs) -> np.ndarray:
+    """
+    输入:
+        mask3d: (Z,Y,X) 的二值/多类标签。>0 视作血管。
+        method: "vmtk" | "baseline"
+    返回:
+        cl3d: (Z,Y,X) 的 uint8 二值体素（1 表示中心线）。
+    说明:
+        - 如果是多类，会将 mask>0 合并。后面可扩展按某些 label 过滤。
+        - VMTK 分支里把 numpy -> vtkImageData，跑 vmtkcenterlines，再 rasterize 回体素。
+        - baseline 分支可以用 3D skeletonize + 细化/修枝（例如 scikit-image + 自己的规则）。
+    """
+    if mask3d is None:
+        raise ValueError("mask3d is None")
+    m = (np.asarray(mask3d) > 0).astype(np.uint8)
+
+    if method.lower() == "baseline":
+        from skimage.morphology import skeletonize_3d
+        sk = skeletonize_3d(m.astype(bool)).astype(np.uint8)
+        # 可在此做修枝/半径估计（根据原始 mask 的距离变换）
+        return sk
+
+    elif method.lower() == "vmtk":
+        # TODO: 这里放置 VMTK 的实现（将来接入）
+        # 先给个兜底：返回 baseline，保证接口通
+        from skimage.morphology import skeletonize_3d
+        return skeletonize_3d(m.astype(bool)).astype(np.uint8)
+
+    else:
+        raise ValueError(f"Unknown method: {method}")
