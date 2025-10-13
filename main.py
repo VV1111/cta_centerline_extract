@@ -62,9 +62,16 @@ class VolumeData(QtCore.QObject):
         
         # mask 相关
         self._mask = None          # 整型标签体素，形状与 _vol 一致
+        self._mask_brain = None     # 去骨/保脑区域（int/uint8）
+        self._mask_vessel = None    # 血管分割（int/uint8）
+        # 旧的 self._mask 保持向后兼容：读取到 _mask_vessel
+        self._spacing_zyx = None 
+
+        
         self.mask_alpha = 0.6      # 0~1 之间
         # self.display_mode = "overlay"   # "overlay" | "image_only" | "mask_only"
         self.display_mode = "overlay"   # "overlay" | "image_only" | "mask_only" | "image_masked"
+        self.edit_target = "vessel"  # 当前编辑目标: "vessel" | "brain"
 
         self._lut_colors = None    # (K, 4) RGBA uint8 颜色表（A通道不用，按像素填）
 
@@ -82,7 +89,128 @@ class VolumeData(QtCore.QObject):
         # self.centerline_display_mode = "off"   # 'off' | 'overlay' | 'only'
         self._centerline = None      # 3D 二值/整型体素，形状 = vol.shape；>0 表示 centerline
         self._cl_color = (255, 80, 80, 255)  # 叠加颜色（可做成可配置）    
+
+        # --- composer switches ---
+        self.apply_brain_mask = False          # 底图是否用 brain mask 裁剪
+        self.seg_overlay_source = "none"       # "none" | "brain" | "vessel"
+
         self.show_centerline = True    
+
+
+
+    # === PATCH START (VolumeData: edit target helpers) ===
+    def set_edit_target(self, target: str):
+        target = (target or "vessel").lower()
+        if target not in ("vessel", "brain"):
+            target = "vessel"
+        if target != self.edit_target:
+            self.edit_target = target
+            self.paramsChanged.emit()
+
+    def _get_active_mask_and_setter(self):
+        """返回(当前编辑mask数组, 写回切片的setter函数)。"""
+        if self.edit_target == "brain":
+            return self._mask_brain, self._set_brain_slice
+        else:
+            return self._mask_vessel, self._set_vessel_slice
+
+    def _set_brain_slice(self, plane, idx, sl):
+        if self._mask_brain is None: return
+        if plane == "Axial":    self._mask_brain[idx,:,:] = sl
+        elif plane == "Coronal":self._mask_brain[:,idx,:] = sl
+        elif plane == "Sagittal":self._mask_brain[:,:,idx] = sl
+
+    def _set_vessel_slice(self, plane, idx, sl):
+        if self._mask_vessel is None: return
+        if plane == "Axial":    self._mask_vessel[idx,:,:] = sl
+        elif plane == "Coronal":self._mask_vessel[:,idx,:] = sl
+        elif plane == "Sagittal":self._mask_vessel[:,:,idx] = sl
+        # 兼容旧逻辑：_mask 始终指向 vessel
+        self._mask = self._mask_vessel
+    # === PATCH END ===
+
+
+
+    def set_apply_brain_mask(self, on: bool):
+        on = bool(on)
+        if on != self.apply_brain_mask:
+            self.apply_brain_mask = on
+            self.paramsChanged.emit()
+
+    def set_seg_overlay_source(self, src: str):
+        src = (src or "none").lower()
+        if src not in ("none", "brain", "vessel"):
+            src = "none"
+        if src != self.seg_overlay_source:
+            self.seg_overlay_source = src
+            self.paramsChanged.emit()
+
+    def load_brain_mask(self, path: str):
+        arr = nib.load(path).get_fdata(dtype=np.float32)
+        m = np.asarray(np.rint(arr).astype(np.int32))
+        if self._vol is None or m.shape != self._vol.shape:
+            raise ValueError("Brain mask shape mismatch.")
+        self._mask_brain = m
+        self.paramsChanged.emit()
+
+    def load_vessel_mask(self, path: str):
+        arr = nib.load(path).get_fdata(dtype=np.float32)
+        m = np.asarray(np.rint(arr).astype(np.int32))
+        if self._vol is None or m.shape != self._vol.shape:
+            raise ValueError("Vessel mask shape mismatch.")
+        self._mask_vessel = m
+        # 维持 LUT（对 vessel）
+        self._mask = m                      # 向后兼容：旧接口仍有效
+        self._build_lut_from_mask()
+        self.paramsChanged.emit()
+
+    def load_mask(self, path: str):
+        self.load_vessel_mask(path)
+
+    def get_brain_mask_slice(self, plane, idx):
+        if self._mask_brain is None: return None
+        z,y,x = self._mask_brain.shape
+        if plane == "Axial":    return self._mask_brain[np.clip(idx,0,z-1), :, :]
+        if plane == "Coronal":  return self._mask_brain[:, np.clip(idx,0,y-1), :]
+        if plane == "Sagittal": return self._mask_brain[:, :, np.clip(idx,0,x-1)]
+        return None
+
+    def get_vessel_mask_slice(self, plane, idx):
+        if self._mask_vessel is None: return None
+        z,y,x = self._mask_vessel.shape
+        if plane == "Axial":    return self._mask_vessel[np.clip(idx,0,z-1), :, :]
+        if plane == "Coronal":  return self._mask_vessel[:, np.clip(idx,0,y-1), :]
+        if plane == "Sagittal": return self._mask_vessel[:, :, np.clip(idx,0,x-1)]
+        return None
+
+
+    def render_base_slice(self, plane, idx) -> np.ndarray:
+        """底图（0~1 float）。若 apply_brain_mask=True 且 brain 存在，则裁剪。"""
+        base = self.render_slice(plane, idx)  # 已有的 WL/WW or minmax
+        if base is None: return None
+        if self.apply_brain_mask and self._mask_brain is not None:
+            bm = self.get_brain_mask_slice(plane, idx)
+            if bm is not None:
+                base = base * (bm > 0).astype(np.float32)
+        return base
+
+    def render_seg_overlay_rgba(self, plane, idx) -> np.ndarray | None:
+        """叠加层：根据 seg_overlay_source 返回 RGBA（HxWx4），或 None。"""
+        if self.seg_overlay_source == "none":
+            return None
+        if self.seg_overlay_source == "brain":
+            sl = self.get_brain_mask_slice(plane, idx)
+            if sl is None: return None
+            # 简单单色（或给它独立 LUT）
+            rgba = np.zeros((*sl.shape,4), np.uint8)
+            on = sl > 0
+            rgba[...,0][on]=80; rgba[...,1][on]=200; rgba[...,2][on]=255; rgba[...,3][on]=int(255*self.mask_alpha)
+            return rgba
+        if self.seg_overlay_source == "vessel":
+            # 用已有 LUT：render_mask_rgba_slice 已按 self._mask（指向 _mask_vessel）
+            return self.render_mask_rgba_slice(plane, idx)
+        return None
+
 
 
     def set_centerline_visible(self, on: bool):
@@ -187,9 +315,12 @@ class VolumeData(QtCore.QObject):
         old_vals = old[changed].copy()
 
         sl[region] = new
-        if plane == "Axial":   self._mask[idx, :, :] = sl
-        elif plane == "Coronal": self._mask[:, idx, :] = sl
-        elif plane == "Sagittal": self._mask[:, :, idx] = sl
+        # if plane == "Axial":   self._mask[idx, :, :] = sl
+        # elif plane == "Coronal": self._mask[:, idx, :] = sl
+        # elif plane == "Sagittal": self._mask[:, :, idx] = sl
+        # === PATCH START (write back slice to active target) ===
+        _, set_slice = self._get_active_mask_and_setter()
+        set_slice(plane, idx, sl)
 
         self._push_undo({
             "type": "disk", "plane": plane, "idx": int(idx),
@@ -198,82 +329,6 @@ class VolumeData(QtCore.QObject):
         })
         self._redo_stack.clear()
         self.paramsChanged.emit()
-
-    # def apply_polygon_fill(self, plane: str, idx: int, poly_rc: np.ndarray):
-    #     """
-    #     poly_rc: N x 2 的 (row, col) 浮点或整点，表示闭合多边形顶点（最后一个不必等于第一个）。
-    #     用 QImage 填充生成二维布尔蒙版，再按 brush_label 改写。
-    #     """
-    #     if not self.has_mask() or not self.is_loaded():
-    #         return
-    #     sl = self.get_mask_slice(plane, idx)
-    #     if sl is None:
-    #         return
-    #     h, w = sl.shape
-
-    #     # # 用 QImage/QPainter 填充多边形 -> 二值图
-    #     # img = QtGui.QImage(w, h, QtGui.QImage.Format_Grayscale8)
-    #     # img.fill(0)
-    #     # painter = QtGui.QPainter(img)
-    #     # painter.setPen(QtCore.Qt.NoPen)
-    #     # painter.setBrush(QtGui.QBrush(QtCore.Qt.white))
-    #     # qpoly = QtGui.QPolygonF([QtCore.QPointF(c, r) for (r, c) in poly_rc])
-    #     # painter.drawPolygon(qpoly)
-    #     # painter.end()
-
-    #     # ptr = img.bits(); ptr.setsize(img.byteCount())
-    #     # mask = np.frombuffer(ptr, dtype=np.uint8).reshape((h, w)) > 0
-
-    #     img = QtGui.QImage(w, h, QtGui.QImage.Format_Grayscale8)
-    #     img.fill(0)
-    #     painter = QtGui.QPainter(img)
-    #     painter.setPen(QtCore.Qt.NoPen)
-    #     painter.setBrush(QtGui.QBrush(QtCore.Qt.white))
-    #     qpoly = QtGui.QPolygonF([QtCore.QPointF(c, r) for (r, c) in poly_rc])
-    #     painter.drawPolygon(qpoly)
-    #     painter.end()
-
-    #     # ptr = img.bits(); ptr.setsize(img.byteCount())
-    #     # stride = img.bytesPerLine()              # 每行实际字节数（含对齐填充）
-    #     # buf = np.frombuffer(ptr, dtype=np.uint8)
-    #     # arr = buf.reshape((h, stride))[:, :w]    # 裁掉行尾填充
-    #     # mask = arr > 0
-    #     ptr = img.bits()  # memoryview
-    #     # Qt6 有 sizeInBytes()/bytesPerLine()，直接用它们，不需要 setsize
-    #     nbytes = int(img.sizeInBytes())
-    #     stride = int(img.bytesPerLine())
-    #     buf = np.frombuffer(ptr, dtype=np.uint8, count=nbytes)
-    #     arr = buf.reshape((h, stride))[:, :w]   # 裁去行尾对齐填充
-    #     mask = arr > 0
-
-
-
-    #     old = sl[mask]
-    #     new = np.full(old.shape, self.brush_label, dtype=np.int32)
-    #     changed = (old != new)
-    #     if not np.any(changed):
-    #         return
-    #     coords = np.argwhere(mask)[changed]
-    #     old_vals = old[changed].copy()
-
-    #     sl[mask] = new
-    #     if plane == "Axial":
-    #         self._mask[idx, :, :] = sl
-    #     elif plane == "Coronal":
-    #         self._mask[:, idx, :] = sl
-    #     elif plane == "Sagittal":
-    #         self._mask[:, :, idx] = sl
-
-    #     self._push_undo({
-    #         "type": "poly",
-    #         "plane": plane,
-    #         "idx": int(idx),
-    #         "coords": coords,
-    #         "old": old_vals,
-    #         "new": np.full_like(old_vals, self.brush_label, dtype=np.int32),
-    #     })
-    #     self._redo_stack.clear()
-    #     self.paramsChanged.emit()
 
     def apply_polygon_fill(self, plane: str, idx: int, poly_rc: np.ndarray):
         if not self.has_mask() or not self.is_loaded(): return
@@ -310,9 +365,12 @@ class VolumeData(QtCore.QObject):
         old_vals = old[changed].copy()
 
         sl[region] = new
-        if plane == "Axial":   self._mask[idx, :, :] = sl
-        elif plane == "Coronal": self._mask[:, idx, :] = sl
-        elif plane == "Sagittal": self._mask[:, :, idx] = sl
+        # if plane == "Axial":   self._mask[idx, :, :] = sl
+        # elif plane == "Coronal": self._mask[:, idx, :] = sl
+        # elif plane == "Sagittal": self._mask[:, :, idx] = sl
+        _, set_slice = self._get_active_mask_and_setter()
+        set_slice(plane, idx, sl)
+
 
         self._push_undo({
             "type": "poly", "plane": plane, "idx": int(idx),
@@ -353,20 +411,34 @@ class VolumeData(QtCore.QObject):
         coords = diff["coords"]
         vals = diff["old"] if use_old else diff["new"]
         sl[coords[:,0], coords[:,1]] = vals
-        if plane == "Axial":
-            self._mask[idx, :, :] = sl
-        elif plane == "Coronal":
-            self._mask[:, idx, :] = sl
-        elif plane == "Sagittal":
-            self._mask[:, :, idx] = sl
+        # if plane == "Axial":
+        #     self._mask[idx, :, :] = sl
+        # elif plane == "Coronal":
+        #     self._mask[:, idx, :] = sl
+        # elif plane == "Sagittal":
+        #     self._mask[:, :, idx] = sl
+
+        _, set_slice = self._get_active_mask_and_setter()
+        set_slice(plane, idx, sl)
+
+
+    # def save_mask(self, path: str):
+    #     if self._mask is None:
+    #         raise ValueError("No mask to save.")
+    #     affine = self._affine if self._affine is not None else np.eye(4)
+    #     img = nib.Nifti1Image(self._mask.astype(np.int32, copy=False), affine)
+    #     nib.save(img, path)
 
     def save_mask(self, path: str):
-        if self._mask is None:
-            raise ValueError("No mask to save.")
+        if self.edit_target == "brain":
+            arr = self._mask_brain
+        else:
+            arr = self._mask_vessel
+        if arr is None:
+            raise ValueError("No mask to save for current edit target.")
         affine = self._affine if self._affine is not None else np.eye(4)
-        img = nib.Nifti1Image(self._mask.astype(np.int32, copy=False), affine)
+        img = nib.Nifti1Image(arr.astype(np.int32, copy=False), affine)
         nib.save(img, path)
-
 
 
     def is_loaded(self):
@@ -378,6 +450,16 @@ class VolumeData(QtCore.QObject):
 
         self._vol = np.asarray(arr)
         self._affine = img.affine
+        # try:
+        #     zooms = img.header.get_zooms()[:3]  # (X,Y,Z)
+        #     self._spacing_zyx = tuple(zooms[::-1])
+        # except Exception:
+        #     self._spacing_zyx = None
+        try:
+            zooms = img.header.get_zooms()[:3]  # (X,Y,Z)
+            self._spacing_zyx = (float(zooms[2]), float(zooms[1]), float(zooms[0]))
+        except Exception:
+            self._spacing_zyx = (1.0, 1.0, 1.0)
         # Reset slice indices to center slices
         z, y, x = self.shape_zyx()
         self.slices["Axial"] = z // 2
@@ -394,17 +476,11 @@ class VolumeData(QtCore.QObject):
 
         self.dataChanged.emit()
         self.paramsChanged.emit()
+        self._centerline = None
+        for attr in ("_centerline_result", "_centerline_mask", "_snakes", "_rois"):
+            if hasattr(self, attr):
+                setattr(self, attr, None) 
 
-    def load_mask(self, path: str):
-        img = nib.load(path)
-        arr = img.get_fdata(dtype=np.float32)
-        self._mask = np.asarray(np.rint(arr).astype(np.int32))  # 四舍五入到整数标签
-        # 简单保护：形状不一致时尝试广播失败就报错
-        if self._vol is None or self._mask.shape != self._vol.shape:
-            raise ValueError(f"Mask shape {self._mask.shape} != image shape {None if self._vol is None else self._vol.shape}")
-        # 构建颜色表
-        self._build_lut_from_mask()
-        self.paramsChanged.emit()   # 触发渲染刷新
 
     def _build_lut_from_mask(self):
         if self._mask is None:
@@ -446,18 +522,21 @@ class VolumeData(QtCore.QObject):
 
 
     def has_mask(self) -> bool:
-        return self._mask is not None
+        if self.edit_target == "brain":
+            return self._mask_brain is not None
+        return self._mask_vessel is not None
+
 
     def get_mask_slice(self, plane: str, idx: int) -> np.ndarray | None:
-        if not self.has_mask():
-            return None
-        z, y, x = self._mask.shape
+        src = self._mask_brain if (self.edit_target == "brain") else self._mask_vessel
+        if src is None: return None
+        z, y, x = src.shape
         if plane == "Axial":
-            idx = np.clip(idx, 0, z - 1);  return self._mask[idx, :, :]
+            idx = np.clip(idx, 0, z-1);  return src[idx, :, :]
         if plane == "Coronal":
-            idx = np.clip(idx, 0, y - 1);  return self._mask[:, idx, :]
+            idx = np.clip(idx, 0, y-1);  return src[:, idx, :]
         if plane == "Sagittal":
-            idx = np.clip(idx, 0, x - 1);  return self._mask[:, :, idx]
+            idx = np.clip(idx, 0, x-1);  return src[:, :, idx]
         return None
 
     def render_mask_rgba_slice(self, plane: str, idx: int) -> np.ndarray | None:
@@ -692,66 +771,64 @@ class ImagePreview(QtWidgets.QFrame):
 
 
         mode = self.volume.display_mode
-        if mode == "image_masked":
-            # 只显示 mask 区域的原图
-            img = self.volume.render_image_masked_slice(self.plane, idx)
-            if img is not None:
-                self.img_item.setImage(img.T, autoLevels=False, levels=(0.0, 1.0))
-                # self.img_item.setImage(img, autoLevels=False, levels=(0.0, 1.0))
-
-                self.view.autoRange()
-            # 该模式下不显示彩色 mask 覆盖
-            self.mask_item.setVisible(False)
-        elif mode == "centerline_only":
-            # 仍然更新底图（用于坐标映射和视域），但隐藏它
-            base = self.volume.render_slice(self.plane, idx)
+        if mode == "centerline_only":
+            # 可选：底图更新但隐藏（保持坐标系一致）
+            base = self.volume.render_base_slice(self.plane, idx)
             if base is not None:
                 self.img_item.setImage(base.T, autoLevels=False, levels=(0.0, 1.0))
             self.img_item.setVisible(False)
             self.mask_item.setVisible(False)
+            self._update_centerline_layer(idx)
+            return
 
-        else:
-            # 正常原图
-            img = self.volume.render_slice(self.plane, idx)
-            if img is not None:
-                self.img_item.setImage(img.T, autoLevels=False, levels=(0.0, 1.0))
-                # self.img_item.setImage(img, autoLevels=False, levels=(0.0, 1.0))
-                self.view.autoRange()
-            # 叠加/仅 mask / 仅图 由这个函数处理
-            self._update_mask_layer(idx)
+        base = self.volume.render_base_slice(self.plane, idx)
+        if base is not None:
+            self.img_item.setImage(base.T, autoLevels=False, levels=(0.0, 1.0))
+            self.view.autoRange()
+            
+        self._update_mask_layer(idx)
         self._update_centerline_layer(idx)
+        
+        
+        
+    # def _update_mask_layer(self, idx: int):
+    #     mode = self.volume.display_mode
+    #     has_mask = self.volume.has_mask()
+    #     if mode == "image_only" or not has_mask:
+    #         self.mask_item.setVisible(False)
+    #         self.img_item.setVisible(True)
+    #         return
 
-        
-        
-        
+    #     # 叠加或仅mask
+    #     rgba = self.volume.render_mask_rgba_slice(self.plane, idx)
+    #     if rgba is None:
+    #         self.mask_item.setVisible(False)
+    #         self.img_item.setVisible(True)
+    #         return
+
+    #     # 注意：RGBA 不转置会导致方向错位，这里也做转置
+    #     self.mask_item.setImage(rgba.transpose(1, 0, 2), autoLevels=False)
+    #     # self.mask_item.setImage(rgba, autoLevels=False)
+
+    #     self.mask_item.setVisible(True)
+
+    #     if mode == "mask_only":
+    #         self.img_item.setVisible(False)
+    #     else:  # overlay
+    #         self.img_item.setVisible(True)
+
     def _update_mask_layer(self, idx: int):
         mode = self.volume.display_mode
-        has_mask = self.volume.has_mask()
-        if mode == "image_only" or not has_mask:
+        rgba = self.volume.render_seg_overlay_rgba(self.plane, idx)
+        if rgba is not None and mode in ("overlay", "mask_only"):
+            self.mask_item.setImage(rgba.transpose(1, 0, 2), autoLevels=False)
+            self.mask_item.setVisible(True)
+            self.img_item.setVisible(mode != "mask_only")
+        else:
             self.mask_item.setVisible(False)
             self.img_item.setVisible(True)
-            return
-
-        # 叠加或仅mask
-        rgba = self.volume.render_mask_rgba_slice(self.plane, idx)
-        if rgba is None:
-            self.mask_item.setVisible(False)
-            self.img_item.setVisible(True)
-            return
-
-        # 注意：RGBA 不转置会导致方向错位，这里也做转置
-        self.mask_item.setImage(rgba.transpose(1, 0, 2), autoLevels=False)
-        # self.mask_item.setImage(rgba, autoLevels=False)
-
-        self.mask_item.setVisible(True)
-
-        if mode == "mask_only":
-            self.img_item.setVisible(False)
-        else:  # overlay
-            self.img_item.setVisible(True)
-
-
-    # External API to set slice index and update image
+            
+    # === PATCH START (ImagePreview.set_slice: align with new pipeline) ===
     def set_slice(self, idx: int):
         if not self.volume.is_loaded():
             return
@@ -759,42 +836,25 @@ class ImagePreview(QtWidgets.QFrame):
         idx = int(np.clip(idx, 0, max_idx))
         if self.volume.slices[self.plane] != idx:
             self.volume.slices[self.plane] = idx
-        # img = self.volume.render_slice(self.plane, idx)
-        # if img is not None:
-        #     self.img_item.setImage(img.T, autoLevels=False, levels=(0.0, 1.0))
 
         mode = self.volume.display_mode
-
-        if mode == "image_masked":
-            # 只显示 mask 区域的原图
-            img = self.volume.render_image_masked_slice(self.plane, idx)
-            if img is not None:
-                self.img_item.setImage(img.T, autoLevels=False, levels=(0.0, 1.0))
-                # self.img_item.setImage(img, autoLevels=False, levels=(0.0, 1.0))
-
-                self.view.autoRange()
-            # 该模式下不显示彩色 mask 覆盖
-            self.mask_item.setVisible(False)
-
-        elif mode == "centerline_only":
-            # 仍然更新底图（用于坐标映射和视域），但隐藏它
-            base = self.volume.render_slice(self.plane, idx)
+        if mode == "centerline_only":
+            base = self.volume.render_base_slice(self.plane, idx)
             if base is not None:
                 self.img_item.setImage(base.T, autoLevels=False, levels=(0.0, 1.0))
             self.img_item.setVisible(False)
             self.mask_item.setVisible(False)
+            self._update_centerline_layer(idx)
+            return
 
-        else:
-            # 正常原图
-            img = self.volume.render_slice(self.plane, idx)
-            if img is not None:
-                self.img_item.setImage(img.T, autoLevels=False, levels=(0.0, 1.0))
-                # self.img_item.setImage(img, autoLevels=False, levels=(0.0, 1.0))
+        base = self.volume.render_base_slice(self.plane, idx)
+        if base is not None:
+            self.img_item.setImage(base.T, autoLevels=False, levels=(0.0, 1.0))
+            self.view.autoRange()
 
-                self.view.autoRange()
-            # 叠加/仅 mask / 仅图 由这个函数处理
-            self._update_mask_layer(idx)
+        self._update_mask_layer(idx)
         self._update_centerline_layer(idx)
+    # === PATCH END ===
 
 class Volume3DPreview(QtWidgets.QFrame):
     """真正的3D小预览：默认空（黑底，不渲染）；点击 Update 后在小窗直接体渲染。"""
@@ -895,66 +955,186 @@ class Volume3DPreview(QtWidgets.QFrame):
         out = np.clip(out, 0.0, 1.0)
         return np.nan_to_num(out, nan=0.0, posinf=1.0, neginf=0.0)
 
+    # def _build_rgba_from_current(self) -> np.ndarray:
+    #     """根据 display_mode 构建 (X,Y,Z,4) RGBA 体素。"""
+    #     vol = self.volume._vol
+    #     norm = self._normalize_volume(vol)               # (Z,Y,X) in [0,1]
+    #     mode = self.volume.display_mode
+    #     has_mask = self.volume.has_mask()
+    #     has_cl = self.volume.has_centerline()
+
+    #     if mode == "image_only" or (mode == "image_masked" and not has_mask):
+    #         rgb = (norm * 255).astype(np.ubyte)
+    #         a   = (norm * 0.6 * 255).astype(np.ubyte)
+    #         rgba = np.stack([rgb, rgb, rgb, a], axis=-1)
+
+    #     elif mode == "centerline_only" and has_cl:
+    #         cl = (self.volume._centerline > 0)
+    #         r, g, b, a = self.volume._cl_color
+    #         R = np.zeros_like(norm, dtype=np.ubyte)
+    #         G = np.zeros_like(norm, dtype=np.ubyte)
+    #         B = np.zeros_like(norm, dtype=np.ubyte)
+    #         A = np.zeros_like(norm, dtype=np.ubyte)
+    #         R[cl] = r; G[cl] = g; B[cl] = b; A[cl] = 255
+    #         rgba = np.stack([R, G, B, A], axis=-1)  # (Z,Y,X,4)
+
+    #     elif mode == "image_masked" and has_mask:
+    #         lab = self.volume._mask
+    #         m = (lab > 0).astype(np.float32)
+    #         rgb = (norm * m * 255).astype(np.ubyte)
+    #         a   = (norm * m * 0.6 * 255).astype(np.ubyte)
+    #         rgba = np.stack([rgb, rgb, rgb, a], axis=-1)
+
+    #     elif mode == "mask_only" and has_mask:
+    #         lab = np.asarray(self.volume._mask, dtype=np.int32)
+    #         lut = self.volume._lut_colors
+    #         K = lut.shape[0]
+    #         lab_clip = np.clip(lab, 0, K-1)
+    #         rgba = lut[lab_clip].astype(np.ubyte)
+    #         if self.volume.mask_alpha < 1.0:
+    #             a = (rgba[..., 3].astype(np.float32) * self.volume.mask_alpha).clip(0,255).astype(np.ubyte)
+    #             rgba = rgba.copy(); rgba[..., 3] = a
+
+    #     else:  # overlay
+    #         rgb = (norm * 255).astype(np.ubyte)
+    #         a   = (norm * 0.4 * 255).astype(np.ubyte)
+    #         rgba = np.stack([rgb, rgb, rgb, a], axis=-1)
+    #         if has_mask and self.volume._lut_colors is not None:
+    #             lab = np.asarray(self.volume._mask, dtype=np.int32)
+    #             K = self.volume._lut_colors.shape[0]
+    #             lab_clip = np.clip(lab, 0, K-1)
+    #             color = self.volume._lut_colors[lab_clip]  # (Z,Y,X,4)
+    #             mask_on = (lab_clip > 0)
+    #             rgba = rgba.copy()
+    #             rgba[..., 0][mask_on] = np.maximum(rgba[..., 0][mask_on], color[..., 0][mask_on])
+    #             rgba[..., 1][mask_on] = np.maximum(rgba[..., 1][mask_on], color[..., 1][mask_on])
+    #             rgba[..., 2][mask_on] = np.maximum(rgba[..., 2][mask_on], color[..., 2][mask_on])
+    #             add_a = int(255 * 0.25 * self.volume.mask_alpha)
+    #             rgba[..., 3][mask_on] = np.clip(rgba[..., 3][mask_on].astype(np.int16) + add_a, 0, 255).astype(np.ubyte)
+
+    #     # (Z,Y,X,4) -> (X,Y,Z,4)
+    #     rgba = np.transpose(rgba, (2, 1, 0, 3)).copy(order='C')
+    #     return rgba
+
+
+    # ==== REPLACE Volume3DPreview._build_rgba_from_current() FROM HERE ====
     def _build_rgba_from_current(self) -> np.ndarray:
-        """根据 display_mode 构建 (X,Y,Z,4) RGBA 体素。"""
-        vol = self.volume._vol
-        norm = self._normalize_volume(vol)               # (Z,Y,X) in [0,1]
-        mode = self.volume.display_mode
-        has_mask = self.volume.has_mask()
-        has_cl = self.volume.has_centerline()
+        """
+        3D 体渲染合成，与 2D 逻辑对齐：
+        - 底图：根据 WL/WW 或 minmax 归一化到 [0,1]
+        - 若 apply_brain_mask=True 且存在 brain mask，则对底图做体素级裁剪
+        - 叠加层来源：seg_overlay_source in {"none","brain","vessel"}
+        - display_mode:
+            * "image_only"        -> 只显示底图
+            * "image_masked"      -> 等价于 image_only（去骨由 apply_brain_mask 决定）
+            * "mask_only"         -> 仅显示叠加层
+            * "overlay"           -> 底图 + 叠加层
+            * "centerline_only"   -> 仅中心线
+        - 若 show_centerline=True 且不是 centerline_only，则在最终结果上额外叠加中心线
+        返回： (X,Y,Z,4) uint8
+        """
+        vd = self.volume
+        vol = vd._vol
+        if vol is None:
+            return None
 
-        if mode == "image_only" or (mode == "image_masked" and not has_mask):
-            rgb = (norm * 255).astype(np.ubyte)
-            a   = (norm * 0.6 * 255).astype(np.ubyte)
-            rgba = np.stack([rgb, rgb, rgb, a], axis=-1)
+        # ---- 1) 归一化底图（Z,Y,X） ----
+        norm = self._normalize_volume(vol)  # [0,1], shape (Z,Y,X)
 
-        elif mode == "centerline_only" and has_cl:
-            cl = (self.volume._centerline > 0)
-            r, g, b, a = self.volume._cl_color
-            R = np.zeros_like(norm, dtype=np.ubyte)
-            G = np.zeros_like(norm, dtype=np.ubyte)
-            B = np.zeros_like(norm, dtype=np.ubyte)
-            A = np.zeros_like(norm, dtype=np.ubyte)
-            R[cl] = r; G[cl] = g; B[cl] = b; A[cl] = 255
-            rgba = np.stack([R, G, B, A], axis=-1)  # (Z,Y,X,4)
+        # ---- 2) 去骨裁剪（全体素）----
+        if getattr(vd, "apply_brain_mask", False) and (vd._mask_brain is not None):
+            bm = (vd._mask_brain > 0).astype(np.float32)
+            norm = norm * bm
 
-        elif mode == "image_masked" and has_mask:
-            lab = self.volume._mask
-            m = (lab > 0).astype(np.float32)
-            rgb = (norm * m * 255).astype(np.ubyte)
-            a   = (norm * m * 0.6 * 255).astype(np.ubyte)
-            rgba = np.stack([rgb, rgb, rgb, a], axis=-1)
+        mode = vd.display_mode
+        seg_src = (vd.seg_overlay_source or "none").lower()
+        mask_alpha = float(getattr(vd, "mask_alpha", 0.6))
 
-        elif mode == "mask_only" and has_mask:
-            lab = np.asarray(self.volume._mask, dtype=np.int32)
-            lut = self.volume._lut_colors
-            K = lut.shape[0]
-            lab_clip = np.clip(lab, 0, K-1)
-            rgba = lut[lab_clip].astype(np.ubyte)
-            if self.volume.mask_alpha < 1.0:
-                a = (rgba[..., 3].astype(np.float32) * self.volume.mask_alpha).clip(0,255).astype(np.ubyte)
-                rgba = rgba.copy(); rgba[..., 3] = a
+        # ---- 3) 生成“底图” RGBA（Z,Y,X,4） ----
+        def _rgba_from_gray(gray, a_scale=0.6):
+            rgb = (gray * 255).astype(np.ubyte)
+            a   = (gray * a_scale * 255).astype(np.ubyte)
+            return np.stack([rgb, rgb, rgb, a], axis=-1)
 
-        else:  # overlay
-            rgb = (norm * 255).astype(np.ubyte)
-            a   = (norm * 0.4 * 255).astype(np.ubyte)
-            rgba = np.stack([rgb, rgb, rgb, a], axis=-1)
-            if has_mask and self.volume._lut_colors is not None:
-                lab = np.asarray(self.volume._mask, dtype=np.int32)
-                K = self.volume._lut_colors.shape[0]
-                lab_clip = np.clip(lab, 0, K-1)
-                color = self.volume._lut_colors[lab_clip]  # (Z,Y,X,4)
-                mask_on = (lab_clip > 0)
-                rgba = rgba.copy()
-                rgba[..., 0][mask_on] = np.maximum(rgba[..., 0][mask_on], color[..., 0][mask_on])
-                rgba[..., 1][mask_on] = np.maximum(rgba[..., 1][mask_on], color[..., 1][mask_on])
-                rgba[..., 2][mask_on] = np.maximum(rgba[..., 2][mask_on], color[..., 2][mask_on])
-                add_a = int(255 * 0.25 * self.volume.mask_alpha)
-                rgba[..., 3][mask_on] = np.clip(rgba[..., 3][mask_on].astype(np.int16) + add_a, 0, 255).astype(np.ubyte)
+        base_rgba = _rgba_from_gray(norm, a_scale=0.6)
 
-        # (Z,Y,X,4) -> (X,Y,Z,4)
+        # ---- 4) 生成“叠加层” RGBA（Z,Y,X,4），与 2D 同口径 ----
+        overlay_rgba = None
+        if seg_src == "brain" and vd._mask_brain is not None:
+            sl = (vd._mask_brain > 0)
+            H, W, D = sl.shape  # (Z,Y,X)
+            overlay_rgba = np.zeros((H, W, D, 4), dtype=np.ubyte)
+            # 青色系：与 2D 相同（80,200,255）
+            overlay_rgba[..., 0][sl] = 80
+            overlay_rgba[..., 1][sl] = 200
+            overlay_rgba[..., 2][sl] = 255
+            overlay_rgba[..., 3][sl] = int(255 * mask_alpha)
+
+        elif seg_src == "vessel" and vd._mask is not None and vd._lut_colors is not None:
+            lab = np.asarray(vd._mask, dtype=np.int32)
+            K = vd._lut_colors.shape[0]
+            lab_clip = np.clip(lab, 0, K - 1)
+            overlay_rgba = vd._lut_colors[lab_clip].astype(np.ubyte)  # (Z,Y,X,4)
+            if mask_alpha < 1.0:
+                a = (overlay_rgba[..., 3].astype(np.float32) * mask_alpha).clip(0, 255).astype(np.ubyte)
+                overlay_rgba = overlay_rgba.copy()
+                overlay_rgba[..., 3] = a
+
+        # ---- 5) 处理 display_mode ----
+        has_cl = vd.has_centerline()
+
+        if mode == "centerline_only":
+            # 仅中心线
+            if has_cl:
+                cl = (vd._centerline > 0)
+                r, g, b, a = vd._cl_color
+                R = np.zeros_like(norm, dtype=np.ubyte)
+                G = np.zeros_like(norm, dtype=np.ubyte)
+                B = np.zeros_like(norm, dtype=np.ubyte)
+                A = np.zeros_like(norm, dtype=np.ubyte)
+                R[cl] = r; G[cl] = g; B[cl] = b; A[cl] = 255
+                rgba = np.stack([R, G, B, A], axis=-1)
+            else:
+                rgba = np.zeros((*norm.shape, 4), dtype=np.ubyte)
+
+        elif mode == "mask_only":
+            if overlay_rgba is not None:
+                rgba = overlay_rgba
+            else:
+                # 没有叠加源时退化为空
+                rgba = np.zeros((*norm.shape, 4), dtype=np.ubyte)
+
+        elif mode in ("image_only", "image_masked"):
+            rgba = base_rgba
+
+        else:  # "overlay"（默认）
+            rgba = base_rgba.copy()
+            if overlay_rgba is not None:
+                # 简单 alpha over：dst = src + over*(1-srcA)
+                # 这里做一个快速的“提亮 + 提高 alpha”效果，与 2D 接近
+                on = overlay_rgba[..., 3] > 0
+                if np.any(on):
+                    rgba[..., 0][on] = np.maximum(rgba[..., 0][on], overlay_rgba[..., 0][on])
+                    rgba[..., 1][on] = np.maximum(rgba[..., 1][on], overlay_rgba[..., 1][on])
+                    rgba[..., 2][on] = np.maximum(rgba[..., 2][on], overlay_rgba[..., 2][on])
+                    add_a = overlay_rgba[..., 3][on]
+                    rgba[..., 3][on] = np.clip(rgba[..., 3][on].astype(np.int16) + add_a.astype(np.int16) // 2, 0, 255).astype(np.ubyte)
+
+        # ---- 6) 如需在其它模式上叠加中心线（与 2D 一致：只要 show_centerline=True 就叠加）----
+        if mode != "centerline_only" and getattr(vd, "show_centerline", True) and has_cl:
+            cl = (vd._centerline > 0)
+            if np.any(cl):
+                r, g, b, a = vd._cl_color
+                # 直接覆盖 RGB，并把 alpha 撑到不透明（线）
+                rgba[..., 0][cl] = r
+                rgba[..., 1][cl] = g
+                rgba[..., 2][cl] = b
+                rgba[..., 3][cl] = 255
+
+        # ---- 7) 轴顺序：(Z,Y,X,4) -> (X,Y,Z,4) 与你现有 3D 保持一致 ----
         rgba = np.transpose(rgba, (2, 1, 0, 3)).copy(order='C')
         return rgba
+    # ==== REPLACE Volume3DPreview._build_rgba_from_current() TO HERE ====
 
 
 class DetailView(QtWidgets.QFrame):
@@ -1067,7 +1247,7 @@ class DetailView(QtWidgets.QFrame):
         # Connect range change to push back to preview
         self.view.sigRangeChanged.connect(self._on_range_changed)
         # 捕获场景事件
-        # self.view.scene().installEventFilter(self) # TODO
+        # self.view.scene().installEventFilter(self) 
         self.glw.scene().installEventFilter(self)
 
 
@@ -1249,73 +1429,41 @@ class DetailView(QtWidgets.QFrame):
         self.view.setXRange(cx - w/2.0, cx + w/2.0, padding=0)
         self.view.setYRange(cy - h/2.0, cy + h/2.0, padding=0)
 
-
+    # === PATCH START (DetailView._rerender_active: use new pipeline) ===
     def _rerender_active(self):
         if self.active_plane is None:
             return
         idx = self.volume.slices[self.active_plane]
+        mode = self.volume.display_mode  # overlay | image_only | mask_only | image_masked | centerline_only
 
-        # # 原图
-        # img = self.volume.render_slice(self.active_plane, idx)
-        # if img is not None:
-        #     self.img_item.setImage(img.T, autoLevels=False, levels=(0.0, 1.0))
-
-        mode = self.volume.display_mode
-
-        if mode == "image_masked":
-            img = self.volume.render_image_masked_slice(self.active_plane, idx)
-            if img is not None:
-                self.img_item.setImage(img.T, autoLevels=False, levels=(0.0, 1.0))
-                # self.img_item.setImage(img, autoLevels=False, levels=(0.0, 1.0))
-
-            # 不显示彩色 mask
-            self.mask_item.setVisible(False)
-            self.img_item.setVisible(True)
-            self._update_centerline_layer(idx)
-            return
-        
-        elif mode == "centerline_only":
-            base = self.volume.render_slice(self.active_plane, idx)
-            if base is not None:
-                self.img_item.setImage(base.T, autoLevels=False, levels=(0.0, 1.0))
-            # 仅显示中心线
+        # 1) centerline_only：只显示中心线
+        if mode == "centerline_only":
             self.img_item.setVisible(False)
             self.mask_item.setVisible(False)
             self._update_centerline_layer(idx)
             return
 
+        # 2) 底图：是否裁剪由 apply_brain_mask 控制
+        base = self.volume.render_base_slice(self.active_plane, idx)
+        if base is not None:
+            self.img_item.setImage(base.T, autoLevels=False, levels=(0.0, 1.0))
+        self.img_item.setVisible(mode in ("overlay", "image_only", "image_masked"))
+
+        # 3) 叠加层：由 seg_overlay_source 控制
+        rgba = self.volume.render_seg_overlay_rgba(self.active_plane, idx)
+        if rgba is not None and mode in ("overlay", "mask_only"):
+            self.mask_item.setImage(rgba.transpose(1,0,2), autoLevels=False)
+            self.mask_item.setVisible(True)
+            if mode == "mask_only":
+                self.img_item.setVisible(False)
         else:
-            # 原图（正常）
-            img = self.volume.render_slice(self.active_plane, idx)
-            if img is not None:
-                self.img_item.setImage(img.T, autoLevels=False, levels=(0.0, 1.0))
-                # self.img_item.setImage(img, autoLevels=False, levels=(0.0, 1.0))
-
-
-        # mask
-        mode = self.volume.display_mode
-        has_mask = self.volume.has_mask()
-        if mode == "image_only" or not has_mask:
             self.mask_item.setVisible(False)
-            self.img_item.setVisible(True)
-            return
 
-        rgba = self.volume.render_mask_rgba_slice(self.active_plane, idx)
-        if rgba is None:
-            self.mask_item.setVisible(False)
-            self.img_item.setVisible(True)
-            return
-
-        self.mask_item.setImage(rgba.transpose(1, 0, 2), autoLevels=False)
-        # self.mask_item.setImage(rgba, autoLevels=False)
-
-        self.mask_item.setVisible(True)
-        if mode == "mask_only":
-            self.img_item.setVisible(False)
-        else:
-            self.img_item.setVisible(True)
-            
+        # 4) 中心线覆盖
         self._update_centerline_layer(idx)
+    # === PATCH END ===
+
+
 
     def promote_from(self, plane: str, src_imgitem: pg.ImageItem, src_viewbox: pg.ViewBox):
         self.active_plane = plane
@@ -1430,13 +1578,23 @@ class LeftToolbar(QtWidgets.QFrame):
     redoRequested = QtCore.Signal()
     toolModeChanged = QtCore.Signal(int)
     applyFilterChanged = QtCore.Signal(object)   # 传 None 或 int
-    
+    editTargetChanged = QtCore.Signal(str)  # "brain" | "vessel"
+
     saveCenterlineYamlRequested = QtCore.Signal()
     saveCenterlineNiftiRequested = QtCore.Signal()
 
     # --- Centerline 相关 ---
     computeCenterlineRequested = QtCore.Signal(str)   # method
     centerlineVisibilityChanged = QtCore.Signal(bool) # show/hide
+
+
+    openBrainMaskRequested = QtCore.Signal()
+    openVesselMaskRequested = QtCore.Signal()
+
+    applyBrainMaskToggled = QtCore.Signal(bool)
+    segOverlaySourceChanged = QtCore.Signal(str)
+
+
 
     def __init__(self):
         super().__init__()
@@ -1459,6 +1617,13 @@ class LeftToolbar(QtWidgets.QFrame):
         self.btnOpenMask.clicked.connect(lambda: self.openMaskRequested.emit())
         lay.addWidget(self.btnOpenMask)
 
+
+        self.btnOpenBrain = QtWidgets.QPushButton("Open Brain Mask")
+        self.btnOpenVessel = QtWidgets.QPushButton("Open Vessel Mask")
+        lay.addWidget(self.btnOpenBrain)
+        lay.addWidget(self.btnOpenVessel)
+
+
         # --- 编辑工具 ---
         sep = QtWidgets.QFrame(); sep.setFrameShape(QtWidgets.QFrame.HLine)
         lay.addWidget(sep)
@@ -1480,6 +1645,27 @@ class LeftToolbar(QtWidgets.QFrame):
         # self.toolModeChanged = QtCore.Signal(int)  # <- 类属性最上面声明
         # self.grpTool.idClicked.connect(self.toolModeChanged.emit)
         self.grpTool.idClicked.connect(lambda i: self.toolModeChanged.emit(int(i)))
+
+        self.cmbEditTarget = QtWidgets.QComboBox()
+        self.cmbEditTarget.addItem("Edit Vessel", userData="vessel")
+        self.cmbEditTarget.addItem("Edit Brain",  userData="brain")
+        lay.addWidget(self.cmbEditTarget)
+        self.cmbEditTarget.currentIndexChanged.connect(
+            lambda: self.editTargetChanged.emit(self.cmbEditTarget.currentData())
+        )
+
+        # Base 裁剪
+        self.chkApplyBrain = QtWidgets.QCheckBox("Apply Brain Mask to Image")
+        lay.addWidget(self.chkApplyBrain)
+
+        # Seg overlay 源选择
+        self.cmbSegOverlay = QtWidgets.QComboBox()
+        self.cmbSegOverlay.addItem("None", userData="none")
+        self.cmbSegOverlay.addItem("Brain", userData="brain")
+        self.cmbSegOverlay.addItem("Vessel", userData="vessel")
+        self.cmbSegOverlay.setCurrentIndex(2)  # 默认 Vessel
+        lay.addWidget(self.cmbSegOverlay)
+
 
         
         # 笔刷半径
@@ -1586,23 +1772,33 @@ class LeftToolbar(QtWidgets.QFrame):
         self.chkShowCL.setChecked(True)
         lay.addWidget(self.chkShowCL)
 
+
+
+
+        self.chkApplyBrain.toggled.connect(self.applyBrainMaskToggled.emit)
+        self.cmbSegOverlay.currentIndexChanged.connect(
+            lambda: self.segOverlaySourceChanged.emit(self.cmbSegOverlay.currentData())
+        )
+
+
         # 连接信号
         self.btnComputeCL.clicked.connect(
             lambda: self.computeCenterlineRequested.emit(self.cmbCLMethod.currentData())
         )
         self.chkShowCL.toggled.connect(self.centerlineVisibilityChanged.emit)
 
-        rowSave = QtWidgets.QHBoxLayout()
-        self.btnSaveCLYaml = QtWidgets.QPushButton("Save CL (YAML)")
-        self.btnSaveCLNii  = QtWidgets.QPushButton("Save CL (NIfTI)")
-        rowSave.addWidget(self.btnSaveCLYaml)
-        rowSave.addWidget(self.btnSaveCLNii)
-        lay.addLayout(rowSave)
 
-        # 连接信号
+        self.btnSaveCLYaml = QtWidgets.QPushButton("Save Centerline (YAML)")
+        self.btnSaveCLMask = QtWidgets.QPushButton("Save Centerline (NIfTI)")
+        lay.addWidget(self.btnSaveCLYaml)
+        lay.addWidget(self.btnSaveCLMask)
+
         self.btnSaveCLYaml.clicked.connect(self.saveCenterlineYamlRequested.emit)
-        self.btnSaveCLNii.clicked.connect(self.saveCenterlineNiftiRequested.emit)
+        self.btnSaveCLMask.clicked.connect(self.saveCenterlineNiftiRequested.emit)  # <- 修正
 
+
+        self.btnOpenBrain.clicked.connect(self.openBrainMaskRequested.emit)
+        self.btnOpenVessel.clicked.connect(self.openVesselMaskRequested.emit)
 
         lay.addStretch(1)
 
@@ -1821,49 +2017,225 @@ class MainWindow(QtWidgets.QMainWindow):
         self.left.saveMaskRequested.connect(self._on_save_mask)
         # 中列预览 -> 右侧放大
         self.middle.zoomRequested.connect(self._promote_preview)
+
+        # 打开两个 mask
+        self.left.openBrainMaskRequested.connect(self._open_brain_mask)
+        self.left.openVesselMaskRequested.connect(self._open_vessel_mask)
+        self.left.editTargetChanged.connect(self._on_edit_target_changed)
+
+        # 合成管线三开关
+
+        self.left.applyBrainMaskToggled.connect(self.volume.set_apply_brain_mask)
+        self.left.segOverlaySourceChanged.connect(self.volume.set_seg_overlay_source)     
+                
         # Centerline：触发与显示
         self.left.computeCenterlineRequested.connect(self._on_compute_centerline)
         self.left.centerlineVisibilityChanged.connect(self.volume.set_centerline_visible)
-        # saving
-        self.left.saveCenterlineYamlRequested.connect(self._on_save_centerline_yaml)
-        self.left.saveCenterlineNiftiRequested.connect(self._on_save_centerline_nii)
+        # # saving
+        # === PATCH START (MainWindow.__init__: fix CL save connects) ===
+        self.left.saveCenterlineYamlRequested.connect(self._save_centerline_yaml)
+        self.left.saveCenterlineNiftiRequested.connect(self._save_centerline_mask)
+        # === PATCH END ===
+
+
 
         # 初始把“作用标签”下拉填充（在加载 mask 后会再次刷新）
         self._refresh_label_combos()
 
 
-    def _on_save_centerline_yaml(self):
+    # === PATCH START (MainWindow: _on_edit_target_changed) ===
+    def _on_edit_target_changed(self, target: str):
+        self.volume.set_edit_target(target)
+        self._refresh_label_combos()
+        self._update_status(f"Edit target: {target}")
+    # === PATCH END ===
+
+
+    def _open_brain_mask(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Open Brain Mask NIfTI", os.getcwd(), "NIfTI (*.nii *.nii.gz)"
+        )
+        if not path: return
+        try:
+            self.volume.load_brain_mask(path)
+            self._update_status(f"Loaded brain mask: {os.path.basename(path)}")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Load Brain Mask Error", str(e))
+
+    def _open_vessel_mask(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Open Vessel Mask NIfTI", os.getcwd(), "NIfTI (*.nii *.nii.gz)"
+        )
+        if not path: return
+        try:
+            self.volume.load_vessel_mask(path)
+            self._refresh_label_combos()  # LUT 根据 vessel 刷新
+            self._update_status(f"Loaded vessel mask: {os.path.basename(path)}")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Load Vessel Mask Error", str(e))
+
+    def _save_centerline_mask(self):
         if not self.volume.has_centerline():
-            QtWidgets.QMessageBox.information(self, "Centerline", "没有可保存的 centerline，请先计算。")
+            QtWidgets.QMessageBox.information(self, "Export", "No centerline to save.")
             return
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save Centerline (YAML)", os.getcwd(), "YAML (*.yaml *.yml)"
+            self, "Save Centerline Mask", os.getcwd(), "NIfTI (*.nii *.nii.gz)"
         )
         if not path:
             return
         try:
-            # 你 utils.centerline.save_centerline_yaml 的签名若不同，请在这里适配。
-            # 最常见：save_centerline_yaml(cl_mask, affine, yaml_path, radius_vox=2)
-            save_centerline_yaml(self.volume._centerline, self.volume._affine, path)
-            self._update_status(f"Saved centerline YAML: {os.path.basename(path)}")
+            from utils.centerline import save_centerline_mask_nii
+            save_centerline_mask_nii(
+                mask_zyx=self.volume._centerline.astype(np.uint8),
+                affine=self.volume._affine,
+                path=path,
+                label_value=99  # 可改
+            )
+            self._update_status(f"Saved centerline mask: {os.path.basename(path)}")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Save Error", str(e))
+
+    def _save_centerline_yaml(self):
+        # 1) 基本检查
+        if not self.volume.has_centerline():
+            QtWidgets.QMessageBox.information(self, "Export", "No centerline to save.")
+            return
+
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save Centerline YAML", os.getcwd(), "YAML (*.yaml *.yml)"
+        )
+        if not path:
+            return
+
+        # 2) 取 spacing、affine
+        sp = getattr(self.volume, "_spacing_zyx", (1.0, 1.0, 1.0))
+        try:
+            spacing_zyx = (float(sp[0]), float(sp[1]), float(sp[2]))
+        except Exception:
+            spacing_zyx = (1.0, 1.0, 1.0)
+
+        affine = getattr(self.volume, "_affine", None)
+        if affine is None:
+            QtWidgets.QMessageBox.critical(self, "Export", "Missing affine.")
+            return
+
+        # 3) 优先从完整结果取 snakes/rois
+        res    = getattr(self.volume, "_centerline_result", None)
+        snakes = getattr(self.volume, "_snakes", None)
+        rois   = getattr(self.volume, "_rois", None)
+        if res is not None:
+            if snakes is None: snakes = getattr(res, "snakes", None)
+            if rois   is None: rois   = getattr(res, "rois", None)
+
+        # 4) 兜底：用当前 mask 重建 snakes/rois
+        if not snakes or rois is None:
+            cl_mask = (
+                getattr(self.volume, "_centerline_mask", None)
+                or getattr(self.volume, "_centerline", None)
+            )
+            if cl_mask is None:
+                QtWidgets.QMessageBox.critical(self, "Export", "No snakes/rois to save for YAML.")
+                return
+
+            try:
+                import numpy as np
+                from uuid import uuid4
+                # 若不是细线，先细化
+                try:
+                    from skimage.morphology import skeletonize_3d
+                    if np.max(cl_mask) > 1 or np.any((cl_mask.astype(bool) ^ skeletonize_3d(cl_mask.astype(bool)))):
+                        skel = skeletonize_3d(cl_mask.astype(bool)).astype(np.uint8)
+                    else:
+                        skel = (cl_mask > 0).astype(np.uint8)
+                except Exception:
+                    skel = (cl_mask > 0).astype(np.uint8)
+
+                # 用 centerline.py 里的工具
+                from utils.centerline import (
+                    _skeleton_to_graph, _resample_edge_voxels, _vox_to_world_xyz,
+                    Snake, ROI, _node_degree_from_edges
+                )
+
+                nodes, edges = _skeleton_to_graph(skel)
+
+                snakes = []
+                for epts in edges:
+                    if len(epts) < 2:
+                        continue
+                    sid = str(uuid4())
+                    # 用 1mm 步长采样；半径先置 0
+                    pts_samp, _ = _resample_edge_voxels(
+                        epts, np.zeros_like(skel, dtype=np.float32), spacing_zyx, step_mm=1.0
+                    )
+                    pts_out = [_vox_to_world_xyz(p, affine) for p in pts_samp]
+                    snakes.append(Snake(id=sid, points=pts_out, radius_mm=[0.0]*len(pts_out)))
+
+                # ROI：把 nodes 投到世界坐标，并用距离容差匹配到 snake 首尾
+                rois = {}
+                def _dist3(a, b):
+                    return ((a[0]-b[0])**2 + (a[1]-b[1])**2 + (a[2]-b[2])**2) ** 0.5
+
+                # 容差：取体素平均间距的 1 倍（毫米）
+                tol = float(sum(spacing_zyx) / 3.0)
+
+                for _, pzyx in nodes.items():
+                    pos_world = _vox_to_world_xyz(pzyx, affine)
+                    deg = _node_degree_from_edges(pzyx, edges)
+                    rtype = 'endpoint' if deg == 1 else ('bifurcation' if deg >= 3 else 'junction')
+                    rid = str(uuid4())
+                    parents = []
+                    for s in snakes:
+                        if not s.points: 
+                            continue
+                        if _dist3(pos_world, s.points[0]) <= tol or _dist3(pos_world, s.points[-1]) <= tol:
+                            parents.append(s.id)
+                    rois[rid] = ROI(
+                        id=rid, position=pos_world, snake_parents=parents, radius_mm=0.0, type=rtype
+                    )
+
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "Export", f"No snakes/rois to save for YAML.\n{e}")
+                return
+
+        # 5) 保存为 CenterlineTree 期望格式（save_centerline_yaml 会统一写 label="ICA_L"）
+        try:
+            from utils.centerline import save_centerline_yaml
+            save_centerline_yaml(
+                path=path,
+                snakes=snakes,
+                rois=rois or {},
+                spacing_zyx=spacing_zyx,
+                # default_label 可换成 UI 选择，如 "ICA_R"
+                default_label="ICA_L",
+            )
+            self._update_status(f"Saved centerline yaml: {os.path.basename(path)}")
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Save YAML Error", str(e))
 
-    def _on_save_centerline_nii(self):
-        if not self.volume.has_centerline():
-            QtWidgets.QMessageBox.information(self, "Centerline", "没有可保存的 centerline，请先计算。")
-            return
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save Centerline (NIfTI)", os.getcwd(), "NIfTI (*.nii *.nii.gz)"
-        )
-        if not path:
-            return
-        try:
-            save_centerline_mask_nii(self.volume._centerline, self.volume._affine, path)
-            self._update_status(f"Saved centerline NIfTI: {os.path.basename(path)}")
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Save NIfTI Error", str(e))
 
+    # def _on_save_centerline_nii(self):
+    #     if not self.volume.has_centerline():
+    #         QtWidgets.QMessageBox.information(self, "Centerline", "没有可保存的 centerline，请先计算。")
+    #         return
+    #     path, _ = QtWidgets.QFileDialog.getSaveFileName(
+    #         self, "Save Centerline (NIfTI)", os.getcwd(), "NIfTI (*.nii *.nii.gz)"
+    #     )
+    #     if not path:
+    #         return
+
+    #     cl_mask = getattr(self.volume, "_centerline_mask", None) or getattr(self.volume, "_centerline", None)
+    #     affine  = getattr(self.volume, "_affine", None)
+    #     if cl_mask is None or affine is None:
+    #         QtWidgets.QMessageBox.critical(self, "Save NIfTI Error", "Missing mask/affine.")
+    #         return
+
+    #     try:
+    #         from utils.centerline import save_centerline_mask_nii
+    #         # 顺序：path, mask, affine
+    #         save_centerline_mask_nii(path, cl_mask, affine, label_value=99)
+    #         self._update_status(f"Saved centerline NIfTI: {os.path.basename(path)}")
+    #     except Exception as e:
+    #         QtWidgets.QMessageBox.critical(self, "Save NIfTI Error", str(e))
 
 
     # ---------- Slots ----------
@@ -1903,15 +2275,44 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.volume.has_mask():
             QtWidgets.QMessageBox.information(self, "Centerline", "请先加载/生成 mask。")
             return
+
         try:
-            from utils.centerline import extract_centerline   # 你新建的单文件模块
+            from utils.centerline import compute_centerline, CenterlineOptions
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Centerline", f"导入 centerline 模块失败：{e}")
             return
+
         try:
-            cl = extract_centerline(self.volume._mask, method=method)
-            self.volume.set_centerline_mask(cl)
-            self._update_status(f"Centerline computed by {method}.")
+            mask_zyx   = (self.volume._mask_vessel if self.volume.edit_target != "brain" else self.volume._mask_brain)
+            if mask_zyx is None:
+                QtWidgets.QMessageBox.information(self, "Centerline", "没有可用的血管/脑掩膜。")
+                return
+
+            spacing_zyx = getattr(self.volume, "_spacing_zyx", (1.0, 1.0, 1.0))
+            affine      = getattr(self.volume, "_affine", None)
+            if affine is None:
+                QtWidgets.QMessageBox.critical(self, "Centerline", "缺少 affine。")
+                return
+
+            opts = CenterlineOptions(
+                method=method,           # "baseline" 或 "vmtk"
+                output_coord_space="world",
+                resample_step_mm=1.0,
+            )
+            res = compute_centerline(mask_zyx.astype(np.uint8) > 0, affine, spacing_zyx, opts)
+
+            # —— 把“完整结果”缓存起来，供保存 YAML/NIfTI 使用 —— #
+            self.volume._centerline_result = res
+            self.volume._centerline_mask   = res.centerline_mask
+            self.volume._snakes            = res.snakes
+            self.volume._rois              = res.rois
+
+            # 同时驱动界面显示（仍用体素 mask 叠加）
+            self.volume.set_centerline_mask(res.centerline_mask)
+
+            self._update_status(
+                f"Centerline computed by {method}. snakes={len(res.snakes)}, rois={len(res.rois)}"
+            )
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Centerline", f"计算失败：{e}")
 
@@ -1953,17 +2354,21 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Save Mask Error", str(e))
 
-
+    # === PATCH START (MainWindow._refresh_label_combos: adapt to target) ===
     def _refresh_label_combos(self):
-        lut = self.volume._lut_colors
         self.left.cmbBrushColor.clear()
         self.left.cmbApplyLabel.clear()
 
-        # Brush：列出 0..K-1（0=Blank 擦除）
-        if lut is None:
-            items = [(0, (0,0,0,0)), (1, (255,0,0,255))]
+        if self.volume.edit_target == "brain":
+            # Brain：二值标签
+            items = [(0, (0,0,0,0)), (1, (255,255,255,255))]
         else:
-            items = [(i, tuple(lut[i])) for i in range(lut.shape[0])]
+            # Vessel：用 LUT
+            lut = self.volume._lut_colors
+            if lut is None:
+                items = [(0, (0,0,0,0)), (1, (255,0,0,255))]
+            else:
+                items = [(i, tuple(lut[i])) for i in range(lut.shape[0])]
 
         for i, rgba in items:
             pix = QtGui.QPixmap(16,16); pix.fill(QtGui.QColor(*rgba))
@@ -1971,7 +2376,6 @@ class MainWindow(QtWidgets.QMainWindow):
             text = "Blank (0)" if i==0 else f"Label {i}"
             self.left.cmbBrushColor.addItem(icon, text, userData=i)
 
-        # ApplyTo：首项 All labels（userData=None），之后 0..K-1
         self.left.cmbApplyLabel.addItem("All labels", userData=None)
         for i, rgba in items:
             pix = QtGui.QPixmap(16,16); pix.fill(QtGui.QColor(*rgba))
@@ -1979,14 +2383,19 @@ class MainWindow(QtWidgets.QMainWindow):
             text = "Blank (0)" if i==0 else f"Label {i}"
             self.left.cmbApplyLabel.addItem(icon, text, userData=i)
 
-        # 默认：Brush=1，ApplyTo=All
         idx1 = self.left.cmbBrushColor.findData(1)
-        if idx1 >= 0: 
+        if idx1 >= 0:
             self.left.cmbBrushColor.setCurrentIndex(idx1)
             self.volume.set_brush_label(1)
+        else:
+            self.left.cmbBrushColor.setCurrentIndex(0)
+            self.volume.set_brush_label(0)
 
         self.left.cmbApplyLabel.setCurrentIndex(0)   # All labels
         self.volume.set_apply_only_label(None)
+    # === PATCH END ===
+
+
 
 
 # ------------------------ Entry ------------------------
